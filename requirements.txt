@@ -1,1 +1,17 @@
-# No third-party dependencies are required for this project right now.
+# Core numerical/scientific stack
+numpy>=1.26
+scipy>=1.11
+matplotlib>=3.8
+pandas>=2.1
+
+# Reinforcement learning environment and algorithms
+gymnasium[classic-control]>=0.29
+stable-baselines3>=2.3
+
+# Training logs and progress display
+tensorboard>=2.15
+tqdm>=4.66
+
+# Saving evaluation videos/demos
+imageio>=2.33
+imageio-ffmpeg>=0.4

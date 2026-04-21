@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Generated experiment outputs
+results/*.csv
+results/*.png
+results/*.pdf
+videos/*.mp4
+videos/*.gif
+models/*.zip
+
+# Accidental local output
+none.png
