@@ -13,5 +13,4 @@ tensorboard>=2.15
 tqdm>=4.66
 
 # Saving evaluation videos/demos
-imageio>=2.33
-imageio-ffmpeg>=0.4
+imageio[ffmpeg]>=2.33

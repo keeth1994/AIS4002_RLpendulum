@@ -10,6 +10,7 @@ import numpy as np
 
 from src.controllers import EnergySwingUpPDController
 from src.envs import RotaryPendulumEnv
+from src.video import save_video_or_gif
 
 
 def run_baseline(
@@ -18,9 +19,10 @@ def run_baseline(
     video_path: Path | None,
     plot_path: Path | None,
     csv_path: Path | None = None,
+    start: str = "upright",
 ) -> dict:
-    env = RotaryPendulumEnv(max_episode_steps=steps, seed=seed)
-    obs, info = env.reset(seed=seed, options={"start": "down"})
+    env = RotaryPendulumEnv(max_episode_steps=steps, seed=seed, start=start)
+    obs, info = env.reset(seed=seed, options={"start": start})
     controller = EnergySwingUpPDController(env.params)
 
     rows = []
@@ -30,7 +32,7 @@ def run_baseline(
         action = controller(env.state.copy())
         obs, reward, terminated, truncated, info = env.step(action)
         total_reward += reward
-        rows.append([step * env.params.dt, info["theta"], info["alpha"], info["theta_dot"], info["alpha_dot"], info["torque"], reward])
+        rows.append([step * env.params.dt, info["theta"], info["alpha"], info["theta_dot"], info["alpha_dot"], info["voltage"], reward])
         if video_path is not None and step % 2 == 0:
             frames.append(env.render())
         if terminated or truncated:
@@ -41,7 +43,7 @@ def run_baseline(
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         with csv_path.open("w", newline="") as file:
             writer = csv.writer(file)
-            writer.writerow(["time", "theta", "alpha", "theta_dot", "alpha_dot", "torque", "reward"])
+            writer.writerow(["time", "theta", "alpha", "theta_dot", "alpha_dot", "voltage", "reward"])
             writer.writerows(rows)
 
     if plot_path is not None:
@@ -55,17 +57,14 @@ def run_baseline(
         axes[1].plot(data[:, 0], np.rad2deg(data[:, 1]))
         axes[1].set_ylabel("theta [deg]")
         axes[2].plot(data[:, 0], data[:, 5])
-        axes[2].set_ylabel("torque [Nm]")
+        axes[2].set_ylabel("voltage [V]")
         axes[2].set_xlabel("time [s]")
         fig.tight_layout()
         fig.savefig(plot_path, dpi=160)
         plt.close(fig)
 
     if video_path is not None and frames:
-        import imageio.v2 as imageio
-
-        video_path.parent.mkdir(parents=True, exist_ok=True)
-        imageio.mimsave(video_path, frames, fps=25)
+        save_video_or_gif(video_path, frames, fps=25)
 
     upright_ratio = float(np.mean(np.abs(data[:, 2]) < np.deg2rad(12))) if len(data) else 0.0
     return {
@@ -83,12 +82,13 @@ def main() -> None:
     parser.add_argument("--video", type=str, default="videos/classical_baseline.mp4")
     parser.add_argument("--plot", type=str, default="results/classical_baseline.png")
     parser.add_argument("--csv", type=str, default="results/classical_baseline.csv")
+    parser.add_argument("--start", choices=["upright", "down", "random"], default="upright")
     args = parser.parse_args()
 
     video_path = None if args.video.lower() == "none" else Path(args.video)
     plot_path = None if args.plot.lower() == "none" else Path(args.plot)
     csv_path = None if args.csv.lower() == "none" else Path(args.csv)
-    metrics = run_baseline(args.steps, args.seed, video_path, plot_path, csv_path)
+    metrics = run_baseline(args.steps, args.seed, video_path, plot_path, csv_path, args.start)
     print("Classical baseline metrics:")
     for key, value in metrics.items():
         print(f"  {key}: {value:.3f}" if isinstance(value, float) else f"  {key}: {value}")

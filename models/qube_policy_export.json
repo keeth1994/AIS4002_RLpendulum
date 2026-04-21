@@ -1,0 +1,14 @@
+{
+  "source_model": "models\\ppo_qube_balance.zip",
+  "algorithm": "PPO",
+  "observation": [
+    "theta_rad",
+    "alpha_rad_upright_zero",
+    "theta_dot_rad_s",
+    "alpha_dot_rad_s"
+  ],
+  "action": "motor_voltage_v",
+  "action_limit_v": 5.0,
+  "notes": "For hardware, load the SB3 .zip model, build the same 4-value observation from QUBE encoders, call model.predict(..., deterministic=True), clip to +/-5 V, and send the result to the motor amplifier.",
+  "policy_class": "ActorCriticPolicy"
+}

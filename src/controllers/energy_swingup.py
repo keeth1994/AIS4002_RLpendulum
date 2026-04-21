@@ -1,4 +1,4 @@
-"""Energy swing-up controller with PD stabilization near upright."""
+"""Energy swing-up controller with voltage PD stabilization for QUBE-Servo 2."""
 
 from __future__ import annotations
 
@@ -8,75 +8,42 @@ from src.envs.rotary_pendulum import RotaryPendulumParams, wrap_angle
 
 
 class EnergySwingUpPDController:
-    """Classical baseline controller used to validate the simulator."""
+    """Classical baseline controller used to validate the simulator.
+
+    This controller returns motor voltage, not torque. It is intentionally
+    simple: far from upright it pumps energy using saturated voltage; near
+    upright it switches to a PD balance controller.
+    """
 
     def __init__(
         self,
         params: RotaryPendulumParams,
-        swing_gain: float = 0.545,
-        pd_alpha: float = 20, 
-        #Controls how strongly the controller corrects pendulum angle error near upright.
-        #Higher value means stronger correction toward upright.
-
-        pd_alpha_dot: float = 10,
-        #Controls damping of pendulum angular velocity near upright.
-        #Higher value slows the pendulum more strongly.
-        
-        pd_theta: float = 0.1,
-        #Controls how much the rotary arm is pulled back toward center.
-
-        pd_theta_dot: float = 0.03,
-        #Damps the arm velocity.
-
-        upright_threshold: float = np.deg2rad(35),
-        #Angle range where the controller switches from swing-up mode to stabilization mode.
-
+        swing_gain: float = 1.0,
+        theta_gain: float = -1.93,
+        alpha_gain: float = 33.40,
+        theta_dot_gain: float = -1.40,
+        alpha_dot_gain: float = 3.08,
+        upright_threshold: float = np.deg2rad(25),
     ) -> None:
         self.params = params
         self.swing_gain = swing_gain
-        self.pd_alpha = pd_alpha
-        self.pd_alpha_dot = pd_alpha_dot
-        self.pd_theta = pd_theta
-        self.pd_theta_dot = pd_theta_dot
+        self.k = np.array(
+            [theta_gain, alpha_gain, theta_dot_gain, alpha_dot_gain],
+            dtype=np.float64,
+        )
         self.upright_threshold = upright_threshold
 
     def __call__(self, state: np.ndarray) -> np.ndarray:
         theta, alpha, theta_dot, alpha_dot = state
-        alpha_error = wrap_angle(alpha)
+        alpha_error = float(wrap_angle(alpha))
+        feedback_state = np.array([theta, alpha_error, theta_dot, alpha_dot], dtype=np.float64)
 
         if abs(alpha_error) < self.upright_threshold:
-            torque = self._inverse_dynamics_pd(theta, alpha_error, theta_dot, alpha_dot)
+            voltage = -float(np.dot(self.k, feedback_state))
         else:
             pump_direction = np.sign(alpha_dot * np.cos(alpha_error) + 1e-6)
-            torque = self.params.torque_limit * pump_direction
-            torque -= self.pd_theta * theta + self.pd_theta_dot * theta_dot
+            voltage = self.swing_gain * self.params.voltage_limit * pump_direction
+            voltage -= 0.2 * theta + 0.05 * theta_dot
 
-        torque = np.clip(torque, -self.params.torque_limit, self.params.torque_limit)
-        return np.array([torque], dtype=np.float32)
-
-    def _inverse_dynamics_pd(
-        self,
-        theta: float,
-        alpha_error: float,
-        theta_dot: float,
-        alpha_dot: float,
-    ) -> float:
-        p = self.params
-        pendulum_inertia = p.pendulum_mass * p.pendulum_length**2
-        desired_alpha_ddot = -self.pd_alpha * alpha_error - self.pd_alpha_dot * alpha_dot
-        gravity_term = p.gravity / p.pendulum_length * np.sin(alpha_error)
-        damping_term = p.pendulum_damping / pendulum_inertia * alpha_dot
-        denominator = p.pendulum_coupling * np.cos(alpha_error)
-
-        if abs(denominator) < 0.15:
-            return 0.0
-
-        desired_theta_ddot = (gravity_term - damping_term - desired_alpha_ddot) / denominator
-        torque = (
-            p.arm_inertia * desired_theta_ddot
-            + p.arm_damping * theta_dot
-            - p.pendulum_coupling * alpha_dot**2 * np.sin(alpha_error)
-            - self.pd_theta * theta
-            - self.pd_theta_dot * theta_dot
-        )
-        return float(torque)
+        voltage = np.clip(voltage, -self.params.voltage_limit, self.params.voltage_limit)
+        return np.array([voltage], dtype=np.float32)
