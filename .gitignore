@@ -13,3 +13,6 @@ models/*.zip
 
 # Accidental local output
 none.png
+
+# VSCode
+.vscode/
