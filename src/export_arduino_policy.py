@@ -1,4 +1,4 @@
-"""Export a trained SB3 PPO policy to a small Arduino-compatible C++ header."""
+"""Export a trained SB3 PPO/SAC policy to a small Arduino-compatible C++ header."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import argparse
 from pathlib import Path
 
 import numpy as np
-from stable_baselines3 import PPO
+from stable_baselines3 import PPO, SAC
 
 
 def format_array(name: str, values: np.ndarray) -> str:
@@ -15,54 +15,86 @@ def format_array(name: str, values: np.ndarray) -> str:
     return f"const float {name}[{flat.size}] = {{{body}}};"
 
 
+def format_float_literal(value: float) -> str:
+    text = f"{value:.9g}"
+    if "." not in text and "e" not in text.lower():
+        text += ".0"
+    return f"{text}f"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-path", type=Path, default=Path("models/ppo_qube_balance_500k.zip"))
+    parser.add_argument("--model-path", type=Path, default=Path("models/ppo_qube_swingup.zip"))
     parser.add_argument("--output", type=Path, default=Path("arduino/qube_policy_runner/qube_policy.h"))
+    parser.add_argument("--algo", choices=["ppo", "sac"], default="ppo")
     parser.add_argument("--voltage-limit", type=float, default=2.0)
     args = parser.parse_args()
 
-    model = PPO.load(args.model_path, device="cpu")
+    model_cls = PPO if args.algo == "ppo" else SAC
+    model = model_cls.load(args.model_path, device="cpu")
     state_dict = model.policy.state_dict()
 
-    required = [
-        "mlp_extractor.policy_net.0.weight",
-        "mlp_extractor.policy_net.0.bias",
-        "mlp_extractor.policy_net.2.weight",
-        "mlp_extractor.policy_net.2.bias",
-        "action_net.weight",
-        "action_net.bias",
-    ]
+    if args.algo == "ppo":
+        required = [
+            "mlp_extractor.policy_net.0.weight",
+            "mlp_extractor.policy_net.0.bias",
+            "mlp_extractor.policy_net.2.weight",
+            "mlp_extractor.policy_net.2.bias",
+            "action_net.weight",
+            "action_net.bias",
+        ]
+        arrays = {
+            "W1": state_dict["mlp_extractor.policy_net.0.weight"].detach().cpu().numpy(),
+            "B1": state_dict["mlp_extractor.policy_net.0.bias"].detach().cpu().numpy(),
+            "W2": state_dict["mlp_extractor.policy_net.2.weight"].detach().cpu().numpy(),
+            "B2": state_dict["mlp_extractor.policy_net.2.bias"].detach().cpu().numpy(),
+            "W3": state_dict["action_net.weight"].detach().cpu().numpy(),
+            "B3": state_dict["action_net.bias"].detach().cpu().numpy(),
+        }
+    else:
+        required = [
+            "actor.latent_pi.0.weight",
+            "actor.latent_pi.0.bias",
+            "actor.latent_pi.2.weight",
+            "actor.latent_pi.2.bias",
+            "actor.mu.weight",
+            "actor.mu.bias",
+        ]
+        arrays = {
+            "W1": state_dict["actor.latent_pi.0.weight"].detach().cpu().numpy(),
+            "B1": state_dict["actor.latent_pi.0.bias"].detach().cpu().numpy(),
+            "W2": state_dict["actor.latent_pi.2.weight"].detach().cpu().numpy(),
+            "B2": state_dict["actor.latent_pi.2.bias"].detach().cpu().numpy(),
+            "W3": state_dict["actor.mu.weight"].detach().cpu().numpy(),
+            "B3": state_dict["actor.mu.bias"].detach().cpu().numpy(),
+        }
     missing = [key for key in required if key not in state_dict]
     if missing:
         raise RuntimeError(f"Unsupported policy architecture. Missing keys: {missing}")
 
-    arrays = {
-        "W1": state_dict["mlp_extractor.policy_net.0.weight"].detach().cpu().numpy(),
-        "B1": state_dict["mlp_extractor.policy_net.0.bias"].detach().cpu().numpy(),
-        "W2": state_dict["mlp_extractor.policy_net.2.weight"].detach().cpu().numpy(),
-        "B2": state_dict["mlp_extractor.policy_net.2.bias"].detach().cpu().numpy(),
-        "W3": state_dict["action_net.weight"].detach().cpu().numpy(),
-        "B3": state_dict["action_net.bias"].detach().cpu().numpy(),
-    }
-
-    if arrays["W1"].shape != (64, 4) or arrays["W2"].shape != (64, 64) or arrays["W3"].shape != (1, 64):
+    input_dim = arrays["W1"].shape[1]
+    hidden_dim = arrays["W1"].shape[0]
+    if input_dim not in (4, 6) or arrays["W2"].shape != (hidden_dim, hidden_dim) or arrays["W3"].shape != (1, hidden_dim):
         raise RuntimeError(
-            "Expected default SB3 PPO MlpPolicy architecture 4 -> 64 -> 64 -> 1. "
+            "Expected a 4/6 -> hidden -> hidden -> 1 policy network. "
             f"Got W1={arrays['W1'].shape}, W2={arrays['W2'].shape}, W3={arrays['W3'].shape}."
         )
+    algorithm_name = args.algo.upper()
+    sac_output_line = "  command = tanh(command);\n" if args.algo == "sac" else ""
 
     header = f"""// Auto-generated from {args.model_path}
-// Deterministic PPO actor for QUBE-Servo 2 balance.
-// Observation order: theta, alpha, theta_dot, alpha_dot.
-// Action output: motor voltage [V], clipped here to +/-{args.voltage_limit}.
+// Deterministic {algorithm_name} actor for QUBE-Servo 2 swing-up and balance.
+// Observation order:
+// - for 6-input policies: sin(theta), cos(theta), sin(alpha), cos(alpha), theta_dot, alpha_dot
+// - for older 4-input policies: theta, alpha, theta_dot, alpha_dot
+// Action output: normalized motor command in [-1, 1], scaled here to +/-{args.voltage_limit} V.
 #pragma once
 
 #include <math.h>
 
-const int QUBE_OBS_DIM = 4;
-const int QUBE_HIDDEN_DIM = 64;
-const float QUBE_POLICY_VOLTAGE_LIMIT = {args.voltage_limit:.9g}f;
+const int QUBE_OBS_DIM = {input_dim};
+const int QUBE_HIDDEN_DIM = {hidden_dim};
+const float QUBE_POLICY_VOLTAGE_LIMIT = {format_float_literal(args.voltage_limit)};
 
 {format_array("QUBE_W1", arrays["W1"])}
 {format_array("QUBE_B1", arrays["B1"])}
@@ -98,18 +130,32 @@ inline float qubePolicyPredictVoltage(
     float alpha,
     float theta_dot,
     float alpha_dot) {{
-  float obs[QUBE_OBS_DIM] = {{theta, alpha, theta_dot, alpha_dot}};
+  float obs[QUBE_OBS_DIM];
+  if (QUBE_OBS_DIM == 6) {{
+    obs[0] = sin(theta);
+    obs[1] = cos(theta);
+    obs[2] = sin(alpha);
+    obs[3] = cos(alpha);
+    obs[4] = theta_dot;
+    obs[5] = alpha_dot;
+  }} else {{
+    obs[0] = theta;
+    obs[1] = alpha;
+    obs[2] = theta_dot;
+    obs[3] = alpha_dot;
+  }}
   float h1[QUBE_HIDDEN_DIM];
   float h2[QUBE_HIDDEN_DIM];
 
   qubeDenseTanh(obs, QUBE_W1, QUBE_B1, QUBE_OBS_DIM, QUBE_HIDDEN_DIM, h1);
   qubeDenseTanh(h1, QUBE_W2, QUBE_B2, QUBE_HIDDEN_DIM, QUBE_HIDDEN_DIM, h2);
 
-  float voltage = QUBE_B3[0];
+  float command = QUBE_B3[0];
   for (int col = 0; col < QUBE_HIDDEN_DIM; ++col) {{
-    voltage += QUBE_W3[col] * h2[col];
+    command += QUBE_W3[col] * h2[col];
   }}
-  return qubeClip(voltage, QUBE_POLICY_VOLTAGE_LIMIT);
+{sac_output_line}  command = qubeClip(command, 1.0f);
+  return qubeClip(command * QUBE_POLICY_VOLTAGE_LIMIT, QUBE_POLICY_VOLTAGE_LIMIT);
 }}
 """
 

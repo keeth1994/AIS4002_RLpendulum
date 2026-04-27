@@ -19,19 +19,40 @@ def run_baseline(
     video_path: Path | None,
     plot_path: Path | None,
     csv_path: Path | None = None,
-    start: str = "upright",
+    arm_limit_deg: float = 60.0,
+    open_loop: bool = False,
+    initial_perturbation: float = 0.25,
+    voltage_limit: float = 2.0,
+    render_style: str = "qube",
 ) -> dict:
-    env = RotaryPendulumEnv(max_episode_steps=steps, seed=seed, start=start)
-    obs, info = env.reset(seed=seed, options={"start": start})
+    env = RotaryPendulumEnv(
+        max_episode_steps=steps,
+        seed=seed,
+        arm_limit_rad=np.deg2rad(arm_limit_deg),
+        initial_perturbation=initial_perturbation,
+        voltage_limit=voltage_limit,
+        render_style=render_style,
+    )
+    obs, info = env.reset(seed=seed)
     controller = EnergySwingUpPDController(env.params)
 
     rows = []
     frames = []
     total_reward = 0.0
+    min_abs_alpha = np.inf
+    max_abs_theta = 0.0
+    termination_reason = "running"
     for step in range(steps):
-        action = controller(env.state.copy())
+        time_s = step * env.params.dt
+        if open_loop:
+            action = controller.open_loop_swingup(time_s, env.state.copy())
+        else:
+            action = controller(env.state.copy())
         obs, reward, terminated, truncated, info = env.step(action)
         total_reward += reward
+        min_abs_alpha = min(min_abs_alpha, abs(info["alpha"]))
+        max_abs_theta = max(max_abs_theta, abs(info["theta"]))
+        termination_reason = info.get("termination_reason", "unknown")
         rows.append([step * env.params.dt, info["theta"], info["alpha"], info["theta_dot"], info["alpha_dot"], info["voltage"], reward])
         if video_path is not None and step % 2 == 0:
             frames.append(env.render())
@@ -72,6 +93,9 @@ def run_baseline(
         "total_reward": float(total_reward),
         "upright_ratio": upright_ratio,
         "final_alpha_deg": float(np.rad2deg(data[-1, 2])) if len(data) else 0.0,
+        "closest_alpha_deg": float(np.rad2deg(min_abs_alpha)) if len(data) else 0.0,
+        "max_abs_theta_deg": float(np.rad2deg(max_abs_theta)) if len(data) else 0.0,
+        "termination_reason": termination_reason,
     }
 
 
@@ -82,13 +106,28 @@ def main() -> None:
     parser.add_argument("--video", type=str, default="videos/classical_baseline.mp4")
     parser.add_argument("--plot", type=str, default="results/classical_baseline.png")
     parser.add_argument("--csv", type=str, default="results/classical_baseline.csv")
-    parser.add_argument("--start", choices=["upright", "down", "random"], default="upright")
+    parser.add_argument("--arm-limit-deg", type=float, default=60.0)
+    parser.add_argument("--open-loop", action="store_true")
+    parser.add_argument("--initial-perturbation", type=float, default=0.25)
+    parser.add_argument("--voltage-limit", type=float, default=2.0)
+    parser.add_argument("--render-style", choices=["qube", "cartpole"], default="qube")
     args = parser.parse_args()
 
     video_path = None if args.video.lower() == "none" else Path(args.video)
     plot_path = None if args.plot.lower() == "none" else Path(args.plot)
     csv_path = None if args.csv.lower() == "none" else Path(args.csv)
-    metrics = run_baseline(args.steps, args.seed, video_path, plot_path, csv_path, args.start)
+    metrics = run_baseline(
+        args.steps,
+        args.seed,
+        video_path,
+        plot_path,
+        csv_path,
+        args.arm_limit_deg,
+        args.open_loop,
+        args.initial_perturbation,
+        args.voltage_limit,
+        args.render_style,
+    )
     print("Classical baseline metrics:")
     for key, value in metrics.items():
         print(f"  {key}: {value:.3f}" if isinstance(value, float) else f"  {key}: {value}")

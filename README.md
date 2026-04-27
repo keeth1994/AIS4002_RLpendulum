@@ -56,40 +56,78 @@ python main.py
 
 ## Useful Commands
 
-Run the classical near-upright balance baseline and save CSV data:
+Run the classical swing-up/balance baseline and save CSV data:
 
 ```bash
-python -m src.evaluate_classical --start upright --video none --plot none --csv results/classical_baseline.csv
+python -m src.evaluate_classical --arm-limit-deg 90 --video none --plot none --csv results/classical_baseline.csv
 ```
 
-Train a PPO balance agent in simulation:
+Train a swing-up agent in simulation. PPO is available, but SAC is usually the
+better first choice for this continuous swing-up task:
 
 ```bash
-python -m src.train_rl --start upright --timesteps 100000 --model-path models/ppo_qube_balance
+python -m src.train_rl --algo sac --arm-limit-deg 90 --timesteps 1000000 --model-path models/sac_qube_swingup
 ```
 
 TensorBoard logging and SB3's rich progress bar are optional. Enable them only if the matching packages are installed:
 
 ```bash
-python -m src.train_rl --start upright --timesteps 100000 --model-path models/ppo_qube_balance --tensorboard --progress-bar
+python -m src.train_rl --algo sac --arm-limit-deg 90 --timesteps 1000000 --model-path models/sac_qube_swingup --tensorboard --progress-bar
 ```
 
 Train with domain randomization:
 
 ```bash
-python -m src.train_rl --start upright --timesteps 100000 --domain-randomization
+python -m src.train_rl --algo sac --arm-limit-deg 90 --timesteps 1000000 --domain-randomization --model-path models/sac_qube_swingup_dr
 ```
+
+If the policy still never reaches upright, first prove the cart-pole surrogate
+can learn with a wider arm range, then tighten back to the real +/-90 degree
+hardware range:
+
+```bash
+python -m src.train_rl --algo sac --arm-limit-deg 180 --timesteps 500000 --model-path models/sac_qube_swingup_180
+python -m src.evaluate_rl --algo sac --arm-limit-deg 180 --model-path models/sac_qube_swingup_180.zip --episodes 10 --steps 1500 --video videos/sac_swingup_180.mp4
+python -m src.train_rl --algo sac --arm-limit-deg 90 --timesteps 500000 --continue-from models/sac_qube_swingup_180.zip --model-path models/sac_qube_swingup_90
+python -m src.evaluate_rl --algo sac --arm-limit-deg 90 --model-path models/sac_qube_swingup_90.zip --episodes 10 --steps 1500 --video videos/sac_swingup_90.mp4
+```
+
+Evaluate the swing-up policy:
+
+```bash
+python -m src.evaluate_rl --algo sac --arm-limit-deg 90 --model-path models/sac_qube_swingup.zip --episodes 10 --steps 1500 --video videos/rl_swingup.mp4
+```
+
+The default video uses a QUBE-style rotary arm, which matches the physical
+platform. To visualize the CartPole-style surrogate model instead, add
+`--render-style cartpole`:
+
+```bash
+python -m src.evaluate_rl --algo sac --arm-limit-deg 90 --model-path models/sac_qube_swingup.zip --episodes 1 --steps 1500 --video videos/rl_swingup_cartpole.gif --render-style cartpole
+```
+
+Export a SAC swing-up policy to Arduino after it works in simulation:
+
+```bash
+python -m src.export_arduino_policy --algo sac --model-path models/sac_qube_swingup_90.zip --output arduino/qube_policy_runner/qube_policy.h --voltage-limit 2.0
+```
+
+The exported policy is only a starting point for hardware tests. If zero-shot
+transfer fails, document the behavior and retrain with improved simulator
+parameters or domain randomization instead of only tuning the Arduino sketch.
+
+Use only a policy trained from the hanging-down initial condition as the main hardware controller.
 
 Evaluate a trained policy and save a demo video:
 
 ```bash
-python -m src.evaluate_rl --start upright --model-path models/ppo_qube_balance.zip
+python -m src.evaluate_rl --algo sac --arm-limit-deg 90 --model-path models/sac_qube_swingup.zip
 ```
 
 Export hardware metadata for a trained policy:
 
 ```bash
-python -m src.export_policy --model-path models/ppo_qube_balance.zip
+python -m src.export_policy --model-path models/sac_qube_swingup_90.zip
 ```
 
 If MP4 export fails because FFMPEG is unavailable, the scripts automatically save a `.gif` fallback in the same folder.
@@ -131,8 +169,8 @@ Quanser/QUBE hardware drivers are not included in `requirements.txt` because the
 ## Assignment Checklist
 
 - Build a Gymnasium-compatible QUBE-Servo 2 rotary inverted pendulum simulation.
-- Validate the simulator with a classical near-upright balance controller.
-- Treat full swing-up from the downward position as a separate harder task.
+- Validate the simulator with a classical swing-up/balance controller.
+- Train and evaluate policies from the hanging-down initial condition.
 - Train an RL agent in simulation, for example with Stable-Baselines3.
 - Compare simulation behavior with real hardware data where available.
 - Improve sim-to-real robustness, for example with domain randomization.
@@ -151,9 +189,9 @@ Quanser/QUBE hardware drivers are not included in `requirements.txt` because the
 
 ## QUBE-Servo 2 Simulation Convention
 
-- Observation: `[theta, alpha, theta_dot, alpha_dot]`
+- Observation: `[sin(theta), cos(theta), sin(alpha), cos(alpha), theta_dot, alpha_dot]`
 - `theta`: rotary arm angle in radians, centered at 0
 - `alpha`: pendulum angle in radians, where 0 is upright and pi is hanging downward
-- Action: motor voltage command in volts
+- Action: normalized motor command in `[-1, 1]`, scaled by `--voltage-limit` inside the simulator
 - Safety limit: action is clipped to +/-5 V and the episode stops if the rotary arm exceeds +/-60 degrees
-- Hardware path: use the same observation ordering from encoders, call the trained policy, clip voltage conservatively, and send voltage to the QUBE API supplied by the course/lab setup
+- Hardware path: the Arduino export computes the same sin/cos observation from encoder angles, calls the trained policy, clips voltage conservatively, and sends voltage to the QUBE API supplied by the course/lab setup

@@ -1,14 +1,13 @@
 """Gymnasium environment for the Quanser QUBE-Servo 2 inverted pendulum.
 
-The simulator uses a voltage-driven Furuta pendulum approximation with common
-QUBE-Servo 2 parameters. It is not a vendor-certified hardware model, but the
-state/action interface is chosen for sim-to-real: encoder states in, motor
-voltage out.
+The simulator uses a CartPole-style surrogate model adapted to the QUBE rotary
+arm. This is intentionally simpler than a full Furuta pendulum model and is
+useful for learning/debugging swing-up behavior before moving toward hardware.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import gymnasium as gym
 import numpy as np
@@ -41,6 +40,8 @@ class RotaryPendulumParams:
     motor_resistance: float = 8.4
     motor_torque_constant: float = 0.042
     motor_back_emf_constant: float = 0.042
+    motor_efficiency: float = 2.5
+    motor_force_constant: float = 0.2
     voltage_limit: float = 5.0
     dt: float = 0.01
 
@@ -63,12 +64,11 @@ class RotaryPendulumEnv(gym.Env):
     Environment convention:
     - theta: rotary arm angle, where 0 is centered.
     - alpha: pendulum angle, where 0 is upright and pi is hanging downward.
-    - action: motor voltage command in volts, clipped to +/-5 V.
-    - observation: [theta, alpha, theta_dot, alpha_dot].
+    - action: normalized motor command in [-1, 1], scaled to voltage_limit.
+    - observation: [sin(theta), cos(theta), sin(alpha), cos(alpha), theta_dot, alpha_dot].
 
-    The internal Furuta equations are expressed in the common Quanser modelling
-    convention where the pendulum angle is zero downward, so alpha is converted
-    internally by alpha_down = alpha + pi.
+    Internally, the rotary arm is approximated as a cart moving along the local
+    tangent direction, with x = arm_length * theta.
     """
 
     metadata = {"render_modes": ["rgb_array"], "render_fps": 100}
@@ -79,24 +79,34 @@ class RotaryPendulumEnv(gym.Env):
         max_episode_steps: int = 1000,
         domain_randomization: bool = False,
         seed: int | None = None,
-        start: str = "down",
+        arm_limit_rad: float = np.deg2rad(60),
+        initial_perturbation: float = 0.25,
+        voltage_limit: float | None = None,
+        render_style: str = "qube",
     ) -> None:
         super().__init__()
+        if render_style not in ("qube", "cartpole"):
+            raise ValueError("render_style must be 'qube' or 'cartpole'")
         self.render_mode = render_mode
+        self.render_style = render_style
         self.max_episode_steps = max_episode_steps
         self.domain_randomization = domain_randomization
-        self.default_start = start
+        self.arm_limit_rad = arm_limit_rad
+        self.initial_perturbation = initial_perturbation
         self.base_params = RotaryPendulumParams()
+        if voltage_limit is not None:
+            self.base_params = replace(self.base_params, voltage_limit=voltage_limit)
         self.params = self.base_params
         self.state = np.zeros(4, dtype=np.float64)
         self.steps = 0
+        self.last_termination_reason = "running"
         self.np_random = np.random.default_rng(seed)
 
-        high = np.array([np.pi, np.pi, 30.0, 40.0], dtype=np.float32)
+        high = np.array([1.0, 1.0, 1.0, 1.0, 30.0, 40.0], dtype=np.float32)
         self.observation_space = spaces.Box(-high, high, dtype=np.float32)
         self.action_space = spaces.Box(
-            low=np.array([-self.base_params.voltage_limit], dtype=np.float32),
-            high=np.array([self.base_params.voltage_limit], dtype=np.float32),
+            low=np.array([-1.0], dtype=np.float32),
+            high=np.array([1.0], dtype=np.float32),
             dtype=np.float32,
         )
 
@@ -111,29 +121,22 @@ class RotaryPendulumEnv(gym.Env):
             self.np_random = np.random.default_rng(seed)
 
         self.params = self._sample_params() if self.domain_randomization else self.base_params
-        options = options or {}
-        start = options.get("start", self.default_start)
+        side = self.np_random.choice([-1.0, 1.0])
+        alpha = np.pi + side * self.np_random.uniform(0.03, self.initial_perturbation)
+        alpha_dot = side * self.np_random.uniform(0.1, 1.0)
 
-        if start == "upright":
-            alpha = self.np_random.normal(0.0, 0.05)
-            alpha_dot = self.np_random.normal(0.0, 0.05)
-        elif start == "random":
-            alpha = self.np_random.uniform(-np.pi, np.pi)
-            alpha_dot = self.np_random.uniform(-1.0, 1.0)
-        else:
-            alpha = np.pi + self.np_random.normal(0.0, 0.05)
-            alpha_dot = self.np_random.normal(0.0, 0.05)
-
-        theta = self.np_random.normal(0.0, 0.02)
-        theta_dot = self.np_random.normal(0.0, 0.05)
+        theta = self.np_random.uniform(-0.05, 0.05)
+        theta_dot = self.np_random.uniform(-0.2, 0.2)
         self.state = np.array([theta, alpha, theta_dot, alpha_dot], dtype=np.float64)
         self.state[:2] = wrap_angle(self.state[:2])
         self.steps = 0
+        self.last_termination_reason = "running"
         return self._get_obs(), self._get_info()
 
     def step(self, action: np.ndarray | list[float] | float) -> tuple[np.ndarray, float, bool, bool, dict]:
-        voltage = float(np.asarray(action, dtype=np.float64).reshape(-1)[0])
-        voltage = float(np.clip(voltage, -self.params.voltage_limit, self.params.voltage_limit))
+        motor_command = float(np.asarray(action, dtype=np.float64).reshape(-1)[0])
+        motor_command = float(np.clip(motor_command, -1.0, 1.0))
+        voltage = motor_command * self.params.voltage_limit
 
         self.state = self._rk4(self.state, voltage, self.params.dt)
         self.state[0] = wrap_angle(self.state[0])
@@ -143,20 +146,34 @@ class RotaryPendulumEnv(gym.Env):
 
         theta, alpha, theta_dot, alpha_dot = self.state
         alpha_error = float(wrap_angle(alpha))
+        is_upright = float(abs(alpha_error) < np.deg2rad(12))
         reward = (
-            4.0 * np.cos(alpha_error)
-            - 0.8 * theta**2
-            - 0.02 * theta_dot**2
-            - 0.01 * alpha_dot**2
-            - 0.001 * voltage**2
+            6.0 * np.cos(alpha_error)
+            + 4.0 * is_upright
+            - 0.15 * theta**2
+            - 2.0 * (theta / self.arm_limit_rad) ** 2
+            - 0.001 * theta_dot**2
+            - 0.0005 * alpha_dot**2
+            - 0.005 * voltage**2
         )
 
-        terminated = abs(theta) > np.deg2rad(60)
+        terminated = abs(theta) > self.arm_limit_rad
+        if terminated:
+            reward -= 1000.0
+            self.last_termination_reason = "arm_limit"
         truncated = self.steps >= self.max_episode_steps
+        if truncated:
+            self.last_termination_reason = "time_limit"
         return self._get_obs(), float(reward), bool(terminated), bool(truncated), self._get_info(voltage)
 
     def render(self) -> np.ndarray:
         """Return a simple top/side visualisation as an RGB frame."""
+        if self.render_style == "cartpole":
+            return self._render_cartpole()
+        return self._render_qube()
+
+    def _render_qube(self) -> np.ndarray:
+        """Return a QUBE-style rotary arm visualisation."""
         frame = np.full((480, 640, 3), 245, dtype=np.uint8)
         theta, alpha, _, _ = self.state
         origin = np.array([320, 240], dtype=np.int32)
@@ -174,43 +191,63 @@ class RotaryPendulumEnv(gym.Env):
         self._draw_circle(frame, bob, 13, (30, 80, 190))
         return frame
 
+    def _render_cartpole(self) -> np.ndarray:
+        """Return a cart-pole view of the surrogate x = arm_length * theta model."""
+        frame = np.full((480, 640, 3), 245, dtype=np.uint8)
+        theta, alpha, _, _ = self.state
+        rail_y = 305
+        rail_margin = 70
+        rail_start = np.array([rail_margin, rail_y], dtype=np.int32)
+        rail_end = np.array([640 - rail_margin, rail_y], dtype=np.int32)
+        usable_width = rail_end[0] - rail_start[0]
+        theta_fraction = np.clip(theta / self.arm_limit_rad, -1.0, 1.0)
+        cart_x = int(320 + theta_fraction * usable_width * 0.5)
+        cart_center = np.array([cart_x, rail_y - 18], dtype=np.int32)
+        cart_half_width = 34
+        cart_half_height = 18
+        pole_len = 160
+        pole_tip = cart_center + np.array(
+            [pole_len * np.sin(alpha), -pole_len * np.cos(alpha)],
+            dtype=np.int32,
+        )
+
+        self._draw_line(frame, rail_start, rail_end, (150, 150, 150), width=2)
+        self._draw_rect(
+            frame,
+            cart_center - np.array([cart_half_width, cart_half_height], dtype=np.int32),
+            cart_center + np.array([cart_half_width, cart_half_height], dtype=np.int32),
+            (190, 110, 35),
+        )
+        self._draw_line(frame, cart_center, pole_tip, (30, 80, 190), width=5)
+        self._draw_circle(frame, cart_center, 7, (40, 40, 40))
+        self._draw_circle(frame, pole_tip, 13, (30, 80, 190))
+        return frame
+
     def _dynamics(self, state: np.ndarray, voltage: float) -> np.ndarray:
         theta, alpha, theta_dot, alpha_dot = state
         p = self.params
 
-        alpha_down = wrap_angle(alpha + np.pi)
-        sin_a = np.sin(alpha_down)
-        cos_a = np.cos(alpha_down)
+        # CartPole-style surrogate: x = r * theta and force = K_v * voltage.
+        total_mass = p.arm_mass + p.pendulum_mass
+        polemass_length = p.pendulum_mass * p.pendulum_com
+        force = p.motor_force_constant * voltage - p.arm_damping * theta_dot
+        sin_a = np.sin(alpha)
+        cos_a = np.cos(alpha)
 
-        jr = p.arm_inertia
-        jp = p.pendulum_inertia
-        m = p.pendulum_mass
-        r = p.arm_length
-        l = p.pendulum_com
-        torque = p.motor_torque_constant * (
-            voltage - p.motor_back_emf_constant * theta_dot
-        ) / p.motor_resistance
-
-        mass_matrix = np.array(
-            [
-                [jr + jp * sin_a**2, m * l * r * cos_a],
-                [m * l * r * cos_a, jp],
-            ],
-            dtype=np.float64,
+        temp = (
+            force
+            + polemass_length * alpha_dot**2 * sin_a
+        ) / total_mass
+        alpha_ddot = (
+            p.gravity * sin_a
+            - cos_a * temp
+            - p.pendulum_damping * alpha_dot / max(polemass_length, 1e-9)
+        ) / (
+            p.pendulum_com
+            * (4.0 / 3.0 - p.pendulum_mass * cos_a**2 / total_mass)
         )
-        rhs = np.array(
-            [
-                torque
-                - p.arm_damping * theta_dot
-                - 2.0 * jp * sin_a * cos_a * theta_dot * alpha_dot
-                + m * l * r * sin_a * alpha_dot**2,
-                -p.pendulum_damping * alpha_dot
-                + jp * sin_a * cos_a * theta_dot**2
-                - m * p.gravity * l * sin_a,
-            ],
-            dtype=np.float64,
-        )
-        theta_ddot, alpha_ddot = np.linalg.solve(mass_matrix, rhs)
+        x_ddot = temp - polemass_length * alpha_ddot * cos_a / total_mass
+        theta_ddot = x_ddot / p.arm_length
         return np.array([theta_dot, alpha_dot, theta_ddot, alpha_ddot], dtype=np.float64)
 
     def _rk4(self, state: np.ndarray, voltage: float, dt: float) -> np.ndarray:
@@ -222,7 +259,17 @@ class RotaryPendulumEnv(gym.Env):
 
     def _get_obs(self) -> np.ndarray:
         theta, alpha, theta_dot, alpha_dot = self.state
-        return np.array([theta, alpha, theta_dot, alpha_dot], dtype=np.float32)
+        return np.array(
+            [
+                np.sin(theta),
+                np.cos(theta),
+                np.sin(alpha),
+                np.cos(alpha),
+                theta_dot,
+                alpha_dot,
+            ],
+            dtype=np.float32,
+        )
 
     def _get_info(self, voltage: float = 0.0) -> dict:
         theta, alpha, theta_dot, alpha_dot = self.state
@@ -233,6 +280,7 @@ class RotaryPendulumEnv(gym.Env):
             "alpha_dot": float(alpha_dot),
             "voltage": float(voltage),
             "is_upright": bool(abs(wrap_angle(alpha)) < np.deg2rad(10)),
+            "termination_reason": self.last_termination_reason,
         }
 
     def _sample_params(self) -> RotaryPendulumParams:
@@ -249,6 +297,8 @@ class RotaryPendulumEnv(gym.Env):
             motor_resistance=p.motor_resistance * scale(0.9, 1.1),
             motor_torque_constant=p.motor_torque_constant * scale(0.9, 1.1),
             motor_back_emf_constant=p.motor_back_emf_constant * scale(0.9, 1.1),
+            motor_efficiency=p.motor_efficiency * scale(0.8, 1.2),
+            motor_force_constant=p.motor_force_constant * scale(0.8, 1.2),
             voltage_limit=p.voltage_limit,
             dt=p.dt,
         )
@@ -282,6 +332,19 @@ class RotaryPendulumEnv(gym.Env):
         y_grid, x_grid = np.ogrid[: frame.shape[0], : frame.shape[1]]
         mask = (x_grid - center[0]) ** 2 + (y_grid - center[1]) ** 2 <= radius**2
         frame[mask] = color
+
+    def _draw_rect(
+        self,
+        frame: np.ndarray,
+        top_left: np.ndarray,
+        bottom_right: np.ndarray,
+        color: tuple[int, int, int],
+    ) -> None:
+        x0 = int(np.clip(top_left[0], 0, frame.shape[1] - 1))
+        y0 = int(np.clip(top_left[1], 0, frame.shape[0] - 1))
+        x1 = int(np.clip(bottom_right[0], 0, frame.shape[1] - 1))
+        y1 = int(np.clip(bottom_right[1], 0, frame.shape[0] - 1))
+        frame[y0 : y1 + 1, x0 : x1 + 1] = color
 
 
 QubeServo2PendulumEnv = RotaryPendulumEnv
