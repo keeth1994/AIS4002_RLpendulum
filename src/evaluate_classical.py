@@ -13,6 +13,13 @@ from src.envs import RotaryPendulumEnv
 from src.video import save_video_or_gif
 
 
+def voltage_to_action(voltage_command: np.ndarray, voltage_limit: float) -> np.ndarray:
+    """Convert a voltage command to the normalized environment action."""
+    voltage = float(np.asarray(voltage_command, dtype=np.float64).reshape(-1)[0])
+    action = np.clip(voltage / voltage_limit, -1.0, 1.0)
+    return np.array([action], dtype=np.float32)
+
+
 def run_baseline(
     steps: int,
     seed: int,
@@ -22,8 +29,13 @@ def run_baseline(
     arm_limit_deg: float = 60.0,
     open_loop: bool = False,
     initial_perturbation: float = 0.25,
-    voltage_limit: float = 2.0,
+    voltage_limit: float = 5.0,
     render_style: str = "qube",
+    controller_kwargs: dict | None = None,
+    reset_mode: str = "down",
+    reward_mode: str = "recovery",
+    terminate_on_arm_limit: bool = True,
+    soft_arm_limit: bool = False,
 ) -> dict:
     env = RotaryPendulumEnv(
         max_episode_steps=steps,
@@ -32,9 +44,13 @@ def run_baseline(
         initial_perturbation=initial_perturbation,
         voltage_limit=voltage_limit,
         render_style=render_style,
+        reset_mode=reset_mode,
+        reward_mode=reward_mode,
+        soft_arm_limit=soft_arm_limit,
+        terminate_on_arm_limit=terminate_on_arm_limit,
     )
     obs, info = env.reset(seed=seed)
-    controller = EnergySwingUpPDController(env.params)
+    controller = EnergySwingUpPDController(env.params, **(controller_kwargs or {}))
 
     rows = []
     frames = []
@@ -45,9 +61,10 @@ def run_baseline(
     for step in range(steps):
         time_s = step * env.params.dt
         if open_loop:
-            action = controller.open_loop_swingup(time_s, env.state.copy())
+            voltage_command = controller.open_loop_swingup(time_s, env.state.copy())
         else:
-            action = controller(env.state.copy())
+            voltage_command = controller.command(env.state.copy(), time_s)
+        action = voltage_to_action(voltage_command, env.params.voltage_limit)
         obs, reward, terminated, truncated, info = env.step(action)
         total_reward += reward
         min_abs_alpha = min(min_abs_alpha, abs(info["alpha"]))
@@ -71,11 +88,14 @@ def run_baseline(
         import matplotlib.pyplot as plt
 
         plot_path.parent.mkdir(parents=True, exist_ok=True)
+        theta_deg = np.rad2deg(np.unwrap(data[:, 1]))
+        alpha_deg = np.rad2deg(np.unwrap(data[:, 2]))
         fig, axes = plt.subplots(3, 1, figsize=(9, 8), sharex=True)
-        axes[0].plot(data[:, 0], np.rad2deg(data[:, 2]))
+        axes[0].plot(data[:, 0], alpha_deg)
         axes[0].axhline(0.0, color="black", linewidth=0.8)
-        axes[0].set_ylabel("alpha [deg]")
-        axes[1].plot(data[:, 0], np.rad2deg(data[:, 1]))
+        axes[0].axhline(180.0, color="black", linewidth=0.8, linestyle="--", alpha=0.4)
+        axes[0].set_ylabel("alpha unwrap [deg]")
+        axes[1].plot(data[:, 0], theta_deg)
         axes[1].set_ylabel("theta [deg]")
         axes[2].plot(data[:, 0], data[:, 5])
         axes[2].set_ylabel("voltage [V]")
@@ -106,11 +126,24 @@ def main() -> None:
     parser.add_argument("--video", type=str, default="videos/classical_baseline.mp4")
     parser.add_argument("--plot", type=str, default="results/classical_baseline.png")
     parser.add_argument("--csv", type=str, default="results/classical_baseline.csv")
-    parser.add_argument("--arm-limit-deg", type=float, default=60.0)
+    parser.add_argument("--arm-limit-deg", type=float, default=90.0)
     parser.add_argument("--open-loop", action="store_true")
     parser.add_argument("--initial-perturbation", type=float, default=0.25)
-    parser.add_argument("--voltage-limit", type=float, default=2.0)
+    parser.add_argument("--voltage-limit", type=float, default=10.0)
     parser.add_argument("--render-style", choices=["qube", "cartpole"], default="qube")
+    parser.add_argument("--reset-mode", choices=["down", "upright", "mixed"], default="down")
+    parser.add_argument("--reward-mode", choices=["report_balance", "recovery"], default="recovery")
+    parser.add_argument("--terminate-on-arm-limit", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--soft-arm-limit", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--energy-gain", type=float, default=50.0)
+    parser.add_argument("--balance-voltage-limit", type=float, default=5.0)
+    parser.add_argument("--swingup-voltage-limit", type=float, default=10.0)
+    parser.add_argument("--swingup-frequency-hz", type=float, default=1.5)
+    parser.add_argument("--swingup-amplitude", type=float, default=10.0)
+    parser.add_argument("--swingup-mode", choices=["oscillatory", "energy"], default="oscillatory")
+    parser.add_argument("--swingup-accel-limit", type=float, default=6.0)
+    parser.add_argument("--arm-centering-gain", type=float, default=1.3235294117647058)
+    parser.add_argument("--arm-centering-rate-gain", type=float, default=1.134453781512605)
     args = parser.parse_args()
 
     video_path = None if args.video.lower() == "none" else Path(args.video)
@@ -127,6 +160,21 @@ def main() -> None:
         args.initial_perturbation,
         args.voltage_limit,
         args.render_style,
+        {
+            "energy_gain": args.energy_gain,
+            "balance_voltage_limit": args.balance_voltage_limit,
+            "swingup_voltage_limit": args.swingup_voltage_limit,
+            "swingup_frequency_hz": args.swingup_frequency_hz,
+            "swingup_amplitude": args.swingup_amplitude,
+            "swingup_mode": args.swingup_mode,
+            "swingup_accel_limit": args.swingup_accel_limit,
+            "arm_centering_gain": args.arm_centering_gain,
+            "arm_centering_rate_gain": args.arm_centering_rate_gain,
+        },
+        args.reset_mode,
+        args.reward_mode,
+        args.terminate_on_arm_limit,
+        args.soft_arm_limit,
     )
     print("Classical baseline metrics:")
     for key, value in metrics.items():

@@ -14,15 +14,19 @@ from src.video import save_video_or_gif
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-path", type=Path, default=Path("models/ppo_rotary_pendulum.zip"))
-    parser.add_argument("--algo", choices=["ppo", "sac"], default="ppo")
+    parser.add_argument("--model-path", type=Path, default=Path("models/sac_qube_swingup.zip"))
+    parser.add_argument("--algo", choices=["ppo", "sac"], default="sac")
     parser.add_argument("--episodes", type=int, default=3)
-    parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--steps", type=int, default=3000)
     parser.add_argument("--seed", type=int, default=10)
     parser.add_argument("--video", type=str, default="videos/rl_policy.mp4")
-    parser.add_argument("--arm-limit-deg", type=float, default=60.0)
+    parser.add_argument("--arm-limit-deg", type=float, default=90.0)
     parser.add_argument("--initial-perturbation", type=float, default=0.25)
-    parser.add_argument("--voltage-limit", type=float, default=2.0)
+    parser.add_argument("--voltage-limit", type=float, default=5.0)
+    parser.add_argument("--soft-arm-limit", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--sensor-noise", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--reset-mode", choices=["down", "upright", "mixed"], default="down")
+    parser.add_argument("--reward-mode", choices=["report_balance", "recovery"], default="report_balance")
     parser.add_argument("--render-style", choices=["qube", "cartpole"], default="qube")
     parser.add_argument("--stochastic", action="store_true")
     args = parser.parse_args()
@@ -35,6 +39,11 @@ def main() -> None:
         arm_limit_rad=np.deg2rad(args.arm_limit_deg),
         initial_perturbation=args.initial_perturbation,
         voltage_limit=args.voltage_limit,
+        soft_arm_limit=args.soft_arm_limit,
+        terminate_on_arm_limit=not args.soft_arm_limit,
+        sensor_noise=args.sensor_noise,
+        reset_mode=args.reset_mode,
+        reward_mode=args.reward_mode,
         render_style=args.render_style,
     )
     frames = []

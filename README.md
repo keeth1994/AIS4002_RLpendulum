@@ -59,7 +59,13 @@ python main.py
 Run the classical swing-up/balance baseline and save CSV data:
 
 ```bash
-python -m src.evaluate_classical --arm-limit-deg 90 --video none --plot none --csv results/classical_baseline.csv
+python -m src.evaluate_classical --video none --plot none --csv results/classical_baseline.csv
+```
+
+Sweep classical energy-controller parameters before retraining RL:
+
+```bash
+python -m src.sweep_classical --arm-limit-deg 90 --voltage-limit 5 --csv results/classical_sweep.csv
 ```
 
 Train a swing-up agent in simulation. PPO is available, but SAC is usually the

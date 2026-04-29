@@ -1,8 +1,8 @@
 """Gymnasium environment for the Quanser QUBE-Servo 2 inverted pendulum.
 
-The simulator uses a CartPole-style surrogate model adapted to the QUBE rotary
-arm. This is intentionally simpler than a full Furuta pendulum model and is
-useful for learning/debugging swing-up behavior before moving toward hardware.
+The simulator uses a coupled rotary/Furuta pendulum grey-box model. It is still
+compact enough for quick RL training, but the pivot follows the QUBE arm arc
+rather than the older straight-line cart surrogate.
 """
 
 from __future__ import annotations
@@ -35,15 +35,15 @@ class RotaryPendulumParams:
     arm_length: float = 0.085
     pendulum_mass: float = 0.024
     pendulum_length: float = 0.129
-    arm_damping: float = 0.001
-    pendulum_damping: float = 0.00005
-    motor_resistance: float = 8.4
+    arm_damping: float = 0.0001
+    pendulum_damping: float = 0.000005
+    motor_resistance: float = 4.2
     motor_torque_constant: float = 0.042
     motor_back_emf_constant: float = 0.042
-    motor_efficiency: float = 2.5
+    motor_efficiency: float = 3.0
     motor_force_constant: float = 0.2
     voltage_limit: float = 5.0
-    dt: float = 0.01
+    dt: float = 1.0 / 300.0
 
     @property
     def pendulum_com(self) -> float:
@@ -67,8 +67,9 @@ class RotaryPendulumEnv(gym.Env):
     - action: normalized motor command in [-1, 1], scaled to voltage_limit.
     - observation: [sin(theta), cos(theta), sin(alpha), cos(alpha), theta_dot, alpha_dot].
 
-    Internally, the rotary arm is approximated as a cart moving along the local
-    tangent direction, with x = arm_length * theta.
+    Internally, the rotary arm is modeled with a coupled Furuta-style mass
+    matrix, so motor torque and arm acceleration affect the pendulum through
+    the real rotary geometry.
     """
 
     metadata = {"render_modes": ["rgb_array"], "render_fps": 100}
@@ -83,16 +84,34 @@ class RotaryPendulumEnv(gym.Env):
         initial_perturbation: float = 0.25,
         voltage_limit: float | None = None,
         render_style: str = "qube",
+        soft_arm_limit: bool = False,
+        arm_limit_brake_gain: float = 5.0,
+        arm_limit_damping: float = 0.25,
+        terminate_on_arm_limit: bool = True,
+        sensor_noise: bool = False,
+        reset_mode: str = "down",
+        reward_mode: str = "report_balance",
     ) -> None:
         super().__init__()
         if render_style not in ("qube", "cartpole"):
             raise ValueError("render_style must be 'qube' or 'cartpole'")
+        if reset_mode not in ("down", "upright", "mixed"):
+            raise ValueError("reset_mode must be 'down', 'upright', or 'mixed'")
+        if reward_mode not in ("report_balance", "recovery"):
+            raise ValueError("reward_mode must be 'report_balance' or 'recovery'")
         self.render_mode = render_mode
         self.render_style = render_style
         self.max_episode_steps = max_episode_steps
         self.domain_randomization = domain_randomization
         self.arm_limit_rad = arm_limit_rad
         self.initial_perturbation = initial_perturbation
+        self.soft_arm_limit = soft_arm_limit
+        self.arm_limit_brake_gain = arm_limit_brake_gain
+        self.arm_limit_damping = arm_limit_damping
+        self.terminate_on_arm_limit = terminate_on_arm_limit
+        self.sensor_noise = sensor_noise
+        self.reset_mode = reset_mode
+        self.reward_mode = reward_mode
         self.base_params = RotaryPendulumParams()
         if voltage_limit is not None:
             self.base_params = replace(self.base_params, voltage_limit=voltage_limit)
@@ -100,6 +119,7 @@ class RotaryPendulumEnv(gym.Env):
         self.state = np.zeros(4, dtype=np.float64)
         self.steps = 0
         self.last_termination_reason = "running"
+        self.was_upright = False
         self.np_random = np.random.default_rng(seed)
 
         high = np.array([1.0, 1.0, 1.0, 1.0, 30.0, 40.0], dtype=np.float32)
@@ -121,22 +141,30 @@ class RotaryPendulumEnv(gym.Env):
             self.np_random = np.random.default_rng(seed)
 
         self.params = self._sample_params() if self.domain_randomization else self.base_params
-        side = self.np_random.choice([-1.0, 1.0])
-        alpha = np.pi + side * self.np_random.uniform(0.03, self.initial_perturbation)
-        alpha_dot = side * self.np_random.uniform(0.1, 1.0)
-
-        theta = self.np_random.uniform(-0.05, 0.05)
         theta_dot = self.np_random.uniform(-0.2, 0.2)
+        reset_mode = self.reset_mode
+        if reset_mode == "mixed":
+            reset_mode = str(self.np_random.choice(["down", "upright"]))
+        if reset_mode == "upright":
+            alpha = self.np_random.uniform(-self.initial_perturbation, self.initial_perturbation)
+            alpha_dot = self.np_random.uniform(-0.6, 0.6)
+        else:
+            side = self.np_random.choice([-1.0, 1.0])
+            alpha = np.pi + side * self.np_random.uniform(0.03, self.initial_perturbation)
+            alpha_dot = side * self.np_random.uniform(0.1, 1.0)
+        theta = self.np_random.uniform(-0.05, 0.05)
         self.state = np.array([theta, alpha, theta_dot, alpha_dot], dtype=np.float64)
         self.state[:2] = wrap_angle(self.state[:2])
         self.steps = 0
         self.last_termination_reason = "running"
+        self.was_upright = bool(abs(wrap_angle(self.state[1])) < np.deg2rad(10.0))
         return self._get_obs(), self._get_info()
 
     def step(self, action: np.ndarray | list[float] | float) -> tuple[np.ndarray, float, bool, bool, dict]:
         motor_command = float(np.asarray(action, dtype=np.float64).reshape(-1)[0])
         motor_command = float(np.clip(motor_command, -1.0, 1.0))
         voltage = motor_command * self.params.voltage_limit
+        voltage = self._apply_soft_arm_limit(voltage, self.state)
 
         self.state = self._rk4(self.state, voltage, self.params.dt)
         self.state[0] = wrap_angle(self.state[0])
@@ -146,21 +174,96 @@ class RotaryPendulumEnv(gym.Env):
 
         theta, alpha, theta_dot, alpha_dot = self.state
         alpha_error = float(wrap_angle(alpha))
-        is_upright = float(abs(alpha_error) < np.deg2rad(12))
-        reward = (
-            6.0 * np.cos(alpha_error)
-            + 4.0 * is_upright
-            - 0.15 * theta**2
-            - 2.0 * (theta / self.arm_limit_rad) ** 2
-            - 0.001 * theta_dot**2
-            - 0.0005 * alpha_dot**2
-            - 0.005 * voltage**2
-        )
+        theta_ratio = theta / max(self.arm_limit_rad, 1e-9)
+        near_limit = max(abs(theta_ratio) - 0.8, 0.0)
+        over_limit = max(abs(theta) - self.arm_limit_rad, 0.0)
 
-        terminated = abs(theta) > self.arm_limit_rad
-        if terminated:
-            reward -= 1000.0
-            self.last_termination_reason = "arm_limit"
+        if self.reward_mode == "report_balance":
+            # Report-style quadratic reward for balance control:
+            # r = F_k - 0.1 * (theta^2 + alpha^2 + theta_dot^2 + alpha_dot^2 + u^2)
+            # where F_k = 1 while state/action constraints are satisfied.
+            alpha_limit_rad = np.deg2rad(10.0)
+            arm_ok = abs(theta) <= self.arm_limit_rad
+            alpha_ok = abs(alpha_error) <= alpha_limit_rad
+            voltage_ok = abs(voltage) <= self.params.voltage_limit + 1e-9
+            constraints_ok = arm_ok and alpha_ok and voltage_ok
+
+            reward = (
+                (1.0 if constraints_ok else 0.0)
+                - 0.1
+                * (
+                    theta**2
+                    + alpha_error**2
+                    + theta_dot**2
+                    + alpha_dot**2
+                    + voltage**2
+                )
+            )
+
+            if not constraints_ok:
+                reward -= 50.0
+
+            terminated = self.terminate_on_arm_limit and (not constraints_ok)
+            if terminated:
+                reward -= 1000.0
+                if not arm_ok:
+                    self.last_termination_reason = "arm_limit"
+                elif not alpha_ok:
+                    self.last_termination_reason = "alpha_limit"
+                else:
+                    self.last_termination_reason = "voltage_limit"
+        else:
+            pendulum_energy = (
+                0.5 * self.params.pendulum_inertia * alpha_dot**2
+                + self.params.pendulum_mass
+                * self.params.gravity
+                * self.params.pendulum_com
+                * (np.cos(alpha_error) + 1.0)
+            )
+            target_energy = (
+                2.0
+                * self.params.pendulum_mass
+                * self.params.gravity
+                * self.params.pendulum_com
+            )
+            energy_error = (pendulum_energy - target_energy) / max(target_energy, 1e-9)
+            energy_score = np.exp(-energy_error**2)
+
+            abs_alpha_error = abs(alpha_error)
+            upright_score = np.exp(-(alpha_error / np.deg2rad(18.0)) ** 2)
+            tight_upright_score = np.exp(-(alpha_error / np.deg2rad(8.0)) ** 2)
+            balanced_score = (
+                tight_upright_score
+                * np.exp(-0.18 * alpha_dot**2)
+                * np.exp(-0.10 * theta_dot**2)
+                * np.exp(-4.0 * theta_ratio**2)
+            )
+            swing_weight = 1.0 - upright_score
+            capture_bonus = float(abs_alpha_error < np.deg2rad(10.0)) * np.exp(
+                -0.08 * theta_dot**2 - 0.12 * alpha_dot**2
+            )
+            recapture_bonus = 3.0 if abs_alpha_error < np.deg2rad(10.0) and not self.was_upright else 0.0
+
+            reward = (
+                3.0 * swing_weight * energy_score
+                + 1.75 * upright_score
+                + 4.0 * tight_upright_score
+                + 16.0 * balanced_score
+                + 3.0 * capture_bonus
+                + recapture_bonus
+                - 0.45 * theta_ratio**2
+                - 10.0 * near_limit**2
+                - 70.0 * over_limit**2
+                - 0.0012 * theta_dot**2
+                - 0.0012 * alpha_dot**2
+                - 0.0010 * voltage**2
+            )
+
+            terminated = self.terminate_on_arm_limit and abs(theta) > self.arm_limit_rad
+            if terminated:
+                reward -= 1000.0
+                self.last_termination_reason = "arm_limit"
+            self.was_upright = abs_alpha_error < np.deg2rad(10.0)
         truncated = self.steps >= self.max_episode_steps
         if truncated:
             self.last_termination_reason = "time_limit"
@@ -192,7 +295,7 @@ class RotaryPendulumEnv(gym.Env):
         return frame
 
     def _render_cartpole(self) -> np.ndarray:
-        """Return a cart-pole view of the surrogate x = arm_length * theta model."""
+        """Return a cart-pole-like debug view of the rotary state."""
         frame = np.full((480, 640, 3), 245, dtype=np.uint8)
         theta, alpha, _, _ = self.state
         rail_y = 305
@@ -227,27 +330,55 @@ class RotaryPendulumEnv(gym.Env):
         theta, alpha, theta_dot, alpha_dot = state
         p = self.params
 
-        # CartPole-style surrogate: x = r * theta and force = K_v * voltage.
-        total_mass = p.arm_mass + p.pendulum_mass
-        polemass_length = p.pendulum_mass * p.pendulum_com
-        force = p.motor_force_constant * voltage - p.arm_damping * theta_dot
-        sin_a = np.sin(alpha)
-        cos_a = np.cos(alpha)
+        # Quanser's rotary-pendulum EOM uses alpha=0 at the hanging-down
+        # position. The project state uses alpha=0 upright, so convert before
+        # applying the nonlinear coupled equations.
+        alpha_down = float(wrap_angle(alpha - np.pi))
+        sin_alpha = np.sin(alpha_down)
+        cos_alpha = np.cos(alpha_down)
 
-        temp = (
-            force
-            + polemass_length * alpha_dot**2 * sin_a
-        ) / total_mass
-        alpha_ddot = (
-            p.gravity * sin_a
-            - cos_a * temp
-            - p.pendulum_damping * alpha_dot / max(polemass_length, 1e-9)
-        ) / (
-            p.pendulum_com
-            * (4.0 / 3.0 - p.pendulum_mass * cos_a**2 / total_mass)
+        jr = p.arm_inertia + p.pendulum_mass * p.arm_length**2
+        jp = p.pendulum_inertia
+        coupling = p.pendulum_mass * p.arm_length * p.pendulum_com * cos_alpha
+        rotary_inertia = jr + jp * sin_alpha**2
+
+        motor_torque = (
+            p.motor_efficiency
+            *
+            p.motor_torque_constant
+            / max(p.motor_resistance, 1e-9)
+            * (voltage - p.motor_back_emf_constant * theta_dot)
         )
-        x_ddot = temp - polemass_length * alpha_ddot * cos_a / total_mass
-        theta_ddot = x_ddot / p.arm_length
+
+        mass_matrix = np.array(
+            [
+                [rotary_inertia, coupling],
+                [coupling, jp],
+            ],
+            dtype=np.float64,
+        )
+
+        coriolis = jp * sin_alpha * cos_alpha
+        rhs = np.array(
+            [
+                motor_torque
+                - p.arm_damping * theta_dot
+                - 2.0 * coriolis * theta_dot * alpha_dot
+                + p.pendulum_mass * p.arm_length * p.pendulum_com * sin_alpha * alpha_dot**2,
+                -p.pendulum_damping * alpha_dot
+                + coriolis * theta_dot**2
+                - p.pendulum_mass * p.gravity * p.pendulum_com * sin_alpha
+            ],
+            dtype=np.float64,
+        )
+
+        det = float(np.linalg.det(mass_matrix))
+        if abs(det) < 1e-9:
+            theta_ddot = 0.0
+            alpha_ddot = 0.0
+        else:
+            theta_ddot, alpha_ddot = np.linalg.solve(mass_matrix, rhs)
+
         return np.array([theta_dot, alpha_dot, theta_ddot, alpha_ddot], dtype=np.float64)
 
     def _rk4(self, state: np.ndarray, voltage: float, dt: float) -> np.ndarray:
@@ -259,7 +390,7 @@ class RotaryPendulumEnv(gym.Env):
 
     def _get_obs(self) -> np.ndarray:
         theta, alpha, theta_dot, alpha_dot = self.state
-        return np.array(
+        obs = np.array(
             [
                 np.sin(theta),
                 np.cos(theta),
@@ -270,6 +401,19 @@ class RotaryPendulumEnv(gym.Env):
             ],
             dtype=np.float32,
         )
+        if self.sensor_noise:
+            obs += np.array(
+                [
+                    self.np_random.normal(0.0, 0.001),
+                    self.np_random.normal(0.0, 0.001),
+                    self.np_random.normal(0.0, 0.001),
+                    self.np_random.normal(0.0, 0.001),
+                    self.np_random.normal(0.0, 0.05),
+                    self.np_random.normal(0.0, 0.075),
+                ],
+                dtype=np.float32,
+            )
+        return np.clip(obs, self.observation_space.low, self.observation_space.high).astype(np.float32)
 
     def _get_info(self, voltage: float = 0.0) -> dict:
         theta, alpha, theta_dot, alpha_dot = self.state
@@ -302,6 +446,27 @@ class RotaryPendulumEnv(gym.Env):
             voltage_limit=p.voltage_limit,
             dt=p.dt,
         )
+
+    def _apply_soft_arm_limit(self, voltage: float, state: np.ndarray) -> float:
+        if not self.soft_arm_limit:
+            return voltage
+
+        theta, _, theta_dot, _ = state
+        limited_voltage = voltage
+        if theta > self.arm_limit_rad:
+            brake_voltage = (
+                -self.arm_limit_brake_gain * (theta - self.arm_limit_rad)
+                - self.arm_limit_damping * theta_dot
+            )
+            limited_voltage = min(limited_voltage, brake_voltage)
+        elif theta < -self.arm_limit_rad:
+            brake_voltage = (
+                -self.arm_limit_brake_gain * (theta + self.arm_limit_rad)
+                - self.arm_limit_damping * theta_dot
+            )
+            limited_voltage = max(limited_voltage, brake_voltage)
+
+        return float(np.clip(limited_voltage, -self.params.voltage_limit, self.params.voltage_limit))
 
     def _draw_line(
         self,
