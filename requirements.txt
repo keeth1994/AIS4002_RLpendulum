@@ -1,6 +1,5 @@
 # Core numerical/scientific stack
 numpy>=1.26
-scipy>=1.11
 matplotlib>=3.8
 pandas>=2.1
 
@@ -8,9 +7,12 @@ pandas>=2.1
 gymnasium[classic-control]>=0.29
 stable-baselines3>=2.3
 
-# Training logs and progress display
+# Hardware serial utilities
+pyserial>=3.5
+
+# Optional training logs and progress display
 tensorboard>=2.15
 tqdm>=4.66
 
-# Saving evaluation videos/demos
+# Optional evaluation videos/demos
 imageio[ffmpeg]>=2.33

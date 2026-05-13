@@ -54,7 +54,86 @@ pip install -r requirements.txt
 python main.py
 ```
 
+## Final Reproducible Workflow
+
+The final reported hardware setup uses the course/example energy controller for
+swing-up and a SAC policy trained in simulation as a bounded residual balance
+controller. This was chosen because direct zero-shot RL swing-up transfer was
+not repeatable on the physical QUBE, while the residual setup was able to
+sustain upright balance after classical capture.
+
+### Train the SAC Balance Policy
+
+This trains the upright balance policy used by the hardware residual controller:
+
+```powershell
+python -m src.train_rl --preset report-balance --timesteps 100000 --seed 81 --model-path models/sac_report_balance_centered_5v_100k --progress-bar
+```
+
+The retained final model is:
+
+```text
+models/sac_report_balance_centered_5v_100k.zip
+```
+
+### Evaluate the Model in Simulation
+
+```powershell
+python -m src.evaluate_rl --preset report-balance --model-path models/sac_report_balance_centered_5v_100k.zip --seed 40
+```
+
+### Test the Model on the QUBE
+
+Connect the QUBE, verify the correct COM port, and place the arm near center
+with the pendulum hanging down before the encoder reset countdown finishes.
+The latest tested port was `COM13`; change `--port` if Windows assigns a
+different port.
+
+```powershell
+python -m src.hardware.run_example_swingup_rl_balance_on_qube --preset report-residual --port COM13 --model-path models/sac_report_balance_centered_5v_100k.zip --csv results/hw_report_demo.csv
+```
+
+This command runs:
+
+- `example_kick` / `example_swingup`: classical energy swing-up.
+- `example_balance`: classical capture near upright.
+- `rl_residual`: SAC policy blended in as a bounded residual voltage command.
+
+Stop a long run manually with `Ctrl+C`; the script shuts the motor off in its
+cleanup block.
+
+### Analyze the Hardware Log
+
+```powershell
+python -m src.analyze_hardware_log results\hw_report_demo.csv
+```
+
+The script reports mode counts, upright ratio, longest upright interval, maximum
+arm travel, voltage usage, and final state.
+
+### Generate Report Figures
+
+```powershell
+python -m src.generate_report_graphs
+```
+
+Figures and metrics are written to:
+
+```text
+results/report_figures/
+```
+
+The retained evidence logs used for the report are:
+
+- `results/classical_hw_example_calm_kick_com13.csv`
+- `results/classical_sim_example_calibrated_defaults.csv`
+- `results/hw_example_rl_residual_06.csv`
+- `results/hw_example_rl_residual_06_repeat.csv`
+
 ## Useful Commands
+
+The commands below are exploratory/development commands kept for reference. The
+final reproducible report workflow is the preset-based workflow above.
 
 Run the classical swing-up/balance baseline and save CSV data:
 
