@@ -9,7 +9,6 @@ results/*.png
 results/*.pdf
 videos/*.mp4
 videos/*.gif
-models/*.zip
 
 # Accidental local output
 none.png
