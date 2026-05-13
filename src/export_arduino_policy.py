@@ -74,9 +74,9 @@ def main() -> None:
 
     input_dim = arrays["W1"].shape[1]
     hidden_dim = arrays["W1"].shape[0]
-    if input_dim not in (4, 6) or arrays["W2"].shape != (hidden_dim, hidden_dim) or arrays["W3"].shape != (1, hidden_dim):
+    if input_dim not in (4, 6, 7) or arrays["W2"].shape != (hidden_dim, hidden_dim) or arrays["W3"].shape != (1, hidden_dim):
         raise RuntimeError(
-            "Expected a 4/6 -> hidden -> hidden -> 1 policy network. "
+            "Expected a 4/6/7 -> hidden -> hidden -> 1 policy network. "
             f"Got W1={arrays['W1'].shape}, W2={arrays['W2'].shape}, W3={arrays['W3'].shape}."
         )
     algorithm_name = args.algo.upper()
@@ -86,6 +86,7 @@ def main() -> None:
 // Deterministic {algorithm_name} actor for QUBE-Servo 2 swing-up and balance.
 // Observation order:
 // - for 6-input policies: sin(theta), cos(theta), sin(alpha), cos(alpha), theta_dot, alpha_dot
+// - for 7-input policies: the 6 values above plus pendulum_speed
 // - for older 4-input policies: theta, alpha, theta_dot, alpha_dot
 // Action output: normalized motor command in [-1, 1], scaled here to +/-{args.voltage_limit} V.
 #pragma once
@@ -95,6 +96,8 @@ def main() -> None:
 const int QUBE_OBS_DIM = {input_dim};
 const int QUBE_HIDDEN_DIM = {hidden_dim};
 const float QUBE_POLICY_VOLTAGE_LIMIT = {format_float_literal(args.voltage_limit)};
+const float QUBE_ARM_LENGTH = 0.085f;
+const float QUBE_PENDULUM_LENGTH = 0.129f;
 
 {format_array("QUBE_W1", arrays["W1"])}
 {format_array("QUBE_B1", arrays["B1"])}
@@ -138,6 +141,17 @@ inline float qubePolicyPredictVoltage(
     obs[3] = cos(alpha);
     obs[4] = theta_dot;
     obs[5] = alpha_dot;
+  }} else if (QUBE_OBS_DIM == 7) {{
+    const float pendulum_speed = sqrt(
+        pow(-QUBE_ARM_LENGTH * sin(theta) * theta_dot + QUBE_PENDULUM_LENGTH * cos(alpha) * alpha_dot, 2.0f) +
+        pow(QUBE_ARM_LENGTH * cos(theta) * theta_dot + QUBE_PENDULUM_LENGTH * sin(alpha) * alpha_dot, 2.0f));
+    obs[0] = sin(theta);
+    obs[1] = cos(theta);
+    obs[2] = sin(alpha);
+    obs[3] = cos(alpha);
+    obs[4] = theta_dot;
+    obs[5] = alpha_dot;
+    obs[6] = pendulum_speed;
   }} else {{
     obs[0] = theta;
     obs[1] = alpha;

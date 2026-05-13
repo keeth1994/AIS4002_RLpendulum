@@ -1,0 +1,3 @@
+log,duration_s,upright_ratio,longest_upright_s,max_abs_theta_deg,mean_abs_voltage_v,final_theta_deg,final_alpha_deg
+hw_example_rl_residual_06.csv,7.996808,0.6845833333333333,5.319647,116.54,0.9967531369642446,-45.7,0.6999999999999886
+hw_example_rl_residual_06_repeat.csv,7.997302,0.6233333333333333,4.807104000000001,120.76,1.1174667709742885,23.2,0.1699999999999875

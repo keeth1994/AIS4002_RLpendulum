@@ -27,7 +27,15 @@ class QUBE:
         self.g = 0
         self.b = 0
         self.writemask = [0, 0, 0, 0, 0, 0]
-        self.output = [
+        self.output = self._neutral_output_packet()
+        self.input = []
+        self.startTime = time.time()
+
+    def _neutral_output_packet(self):
+        # The Python_Serial.ino bridge interprets motor bytes as an always-active
+        # command with an offset of +999. That means [0, 0] is full negative
+        # drive, not "do nothing". Idle packets must explicitly encode zero speed.
+        return [
             0,  # reset enc0 - 0
             0,  # reset enc1 - 1
             0,  # red msb - 2
@@ -36,11 +44,9 @@ class QUBE:
             0,  # green lsb - 5
             0,  # blue msb - 6
             0,  # blue lsb - 7
-            0,  # motor msb - 8
-            0,  # motor lsb - 9
-        ]  # set motor
-        self.input = []
-        self.startTime = time.time()
+            3,  # motor msb for 0 command (999)
+            231,  # motor lsb for 0 command (999)
+        ]
 
     # Getters
     def getMotorAngle(self):
@@ -103,15 +109,24 @@ class QUBE:
         self.writemask[3] = SET_LED_GREEN
         self.writemask[4] = SET_LED_BLUE
 
-    def readByte(self):
-        return int.from_bytes(self.master.read(), "little")
+    def reset_buffers(self):
+        self.master.reset_input_buffer()
+        self.master.reset_output_buffer()
+
+    def _read_exactly(self, size):
+        data = self.master.read(size)
+        if len(data) != size:
+            raise TimeoutError(
+                f"Expected {size} reply bytes from QUBE bridge, received {len(data)}"
+            )
+        return data
 
     # Serial communication and bit manipulation
-    def receiveEncoderAngle(self):
-        rev_MSB = self.readByte()
-        rev_LSB = self.readByte()
-        ang_MSB = self.readByte()
-        ang_LSB = self.readByte()
+    def receiveEncoderAngle(self, packet, offset):
+        rev_MSB = packet[offset + 0]
+        rev_LSB = packet[offset + 1]
+        ang_MSB = packet[offset + 2]
+        ang_LSB = packet[offset + 3]
 
         dir = rev_MSB >> 7
         revolutions = (rev_LSB) + (rev_MSB << 8) - (dir * 2**15)
@@ -126,18 +141,18 @@ class QUBE:
 
         return revolutions * 360.0 + angle
 
-    def receiveMotorRPM(self):
-        rpm_MSB = self.readByte()
-        rpm_LSB = self.readByte()
+    def receiveMotorRPM(self, packet, offset):
+        rpm_MSB = packet[offset + 0]
+        rpm_LSB = packet[offset + 1]
         dir = rpm_MSB >> 7
         rpm = ((rpm_MSB - (dir << 7)) << 8) | rpm_LSB
         if dir:
             rpm = -rpm
         return rpm
 
-    def receiveMotorCurrent(self):
-        current_MSB = self.readByte()
-        current_LSB = self.readByte()
+    def receiveMotorCurrent(self, packet, offset):
+        current_MSB = packet[offset + 0]
+        current_LSB = packet[offset + 1]
 
         current = (current_MSB << 8) | current_LSB
         return current
@@ -173,9 +188,10 @@ class QUBE:
         for byte in self.output:
             data.append(byte)
         self.master.write(bytearray(data))
-        self.output = [0] * 10
+        self.output = self._neutral_output_packet()
+        packet = self._read_exactly(12)
 
-        self.motorAngle = self.receiveEncoderAngle()
-        self.pendulumAngle = self.receiveEncoderAngle()
-        self.rpm = self.receiveMotorRPM()
-        self.current = self.receiveMotorCurrent()
+        self.motorAngle = self.receiveEncoderAngle(packet, 0)
+        self.pendulumAngle = self.receiveEncoderAngle(packet, 4)
+        self.rpm = self.receiveMotorRPM(packet, 8)
+        self.current = self.receiveMotorCurrent(packet, 10)

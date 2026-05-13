@@ -11,25 +11,62 @@ from stable_baselines3 import PPO, SAC
 from src.envs import RotaryPendulumEnv
 from src.video import save_video_or_gif
 
+REPORT_BALANCE_PRESET = {
+    "algo": "sac",
+    "episodes": 10,
+    "steps": 1500,
+    "video": "none",
+    "arm_limit_deg": 60.0,
+    "initial_perturbation": 0.08,
+    "voltage_limit": 5.0,
+    "soft_arm_limit": True,
+    "sensor_noise": False,
+    "reset_mode": "upright",
+    "reward_mode": "report_balance",
+    "obs_mode": "base6",
+    "action_filter_alpha": 1.0,
+    "voltage_slew_rate": 0.0,
+    "action_rate_penalty": 0.0,
+    "motor_dead_voltage": 0.0,
+}
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-path", type=Path, default=Path("models/sac_qube_swingup.zip"))
+    parser.add_argument(
+        "--preset",
+        choices=["custom", "report-balance"],
+        default="custom",
+        help="Use a named simulation evaluation setup matching the report balance policy.",
+    )
+    parser.add_argument("--model-path", type=Path, default=Path("models/sac_qube_classical_env_speed_obs.zip"))
     parser.add_argument("--algo", choices=["ppo", "sac"], default="sac")
     parser.add_argument("--episodes", type=int, default=3)
-    parser.add_argument("--steps", type=int, default=3000)
+    parser.add_argument("--steps", type=int, default=5000)
     parser.add_argument("--seed", type=int, default=10)
     parser.add_argument("--video", type=str, default="videos/rl_policy.mp4")
     parser.add_argument("--arm-limit-deg", type=float, default=90.0)
     parser.add_argument("--initial-perturbation", type=float, default=0.25)
-    parser.add_argument("--voltage-limit", type=float, default=5.0)
+    parser.add_argument("--voltage-limit", type=float, default=10.0)
     parser.add_argument("--soft-arm-limit", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--sensor-noise", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--reset-mode", choices=["down", "upright", "mixed"], default="down")
-    parser.add_argument("--reward-mode", choices=["report_balance", "recovery"], default="report_balance")
+    parser.add_argument(
+        "--reward-mode",
+        choices=["report_balance", "recovery", "recovery_speed", "hardware_recovery"],
+        default="recovery_speed",
+    )
+    parser.add_argument("--obs-mode", choices=["base6", "speed7", "speed8"], default="speed7")
+    parser.add_argument("--action-filter-alpha", type=float, default=1.0)
+    parser.add_argument("--voltage-slew-rate", type=float, default=0.0)
+    parser.add_argument("--action-rate-penalty", type=float, default=0.0)
+    parser.add_argument("--motor-dead-voltage", type=float, default=0.0)
     parser.add_argument("--render-style", choices=["qube", "cartpole"], default="qube")
     parser.add_argument("--stochastic", action="store_true")
     args = parser.parse_args()
+    if args.preset == "report-balance":
+        for name, value in REPORT_BALANCE_PRESET.items():
+            setattr(args, name, value)
 
     model_cls = PPO if args.algo == "ppo" else SAC
     model = model_cls.load(args.model_path)
@@ -44,7 +81,12 @@ def main() -> None:
         sensor_noise=args.sensor_noise,
         reset_mode=args.reset_mode,
         reward_mode=args.reward_mode,
+        obs_mode=args.obs_mode,
         render_style=args.render_style,
+        action_filter_alpha=args.action_filter_alpha,
+        voltage_slew_rate=args.voltage_slew_rate,
+        action_rate_penalty=args.action_rate_penalty,
+        motor_dead_voltage=args.motor_dead_voltage,
     )
     frames = []
     returns = []

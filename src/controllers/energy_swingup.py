@@ -19,7 +19,8 @@ class EnergySwingUpPDController:
     def __init__(
         self,
         params: RotaryPendulumParams,
-        energy_gain: float = 50.0,
+        energy_gain: float = 300.0,
+        energy_deadband: float = 0.002,
         theta_gain: float = -1.3235294117647058,
         alpha_gain: float = 18.90760723931717,
         theta_dot_gain: float = -1.134453781512605,
@@ -27,12 +28,16 @@ class EnergySwingUpPDController:
         upright_threshold: float = np.deg2rad(20),
         balance_exit_threshold: float = np.deg2rad(35),
         balance_voltage_limit: float = 5.0,
-        swingup_voltage_limit: float = 2.5,
+        swingup_voltage_limit: float = 10.0,
         swingup_frequency_hz: float = 1.5,
         swingup_amplitude: float = 10.0,
-        swingup_accel_limit: float = 6.0,
-        arm_centering_gain: float = 1.3235294117647058,
-        arm_centering_rate_gain: float = 1.134453781512605,
+        swingup_accel_limit: float = 8.0,
+        arm_centering_gain: float = 2.0,
+        arm_centering_rate_gain: float = 0.3,
+        startup_kick_voltage: float = 2.5,
+        startup_alpha_threshold: float = np.deg2rad(8.0),
+        startup_alpha_dot_threshold: float = 0.25,
+        startup_theta_target: float = np.deg2rad(20.0),
         swingup_mode: str = "oscillatory",
         use_stateful_switching: bool = True,
     ) -> None:
@@ -40,6 +45,7 @@ class EnergySwingUpPDController:
             raise ValueError("swingup_mode must be 'oscillatory' or 'energy'")
         self.params = params
         self.energy_gain = energy_gain
+        self.energy_deadband = energy_deadband
         self.balance_voltage_limit = min(balance_voltage_limit, params.voltage_limit)
         self.swingup_voltage_limit = min(swingup_voltage_limit, params.voltage_limit)
         self.swingup_frequency_hz = swingup_frequency_hz
@@ -47,6 +53,10 @@ class EnergySwingUpPDController:
         self.swingup_accel_limit = swingup_accel_limit
         self.arm_centering_gain = arm_centering_gain
         self.arm_centering_rate_gain = arm_centering_rate_gain
+        self.startup_kick_voltage = min(startup_kick_voltage, self.swingup_voltage_limit)
+        self.startup_alpha_threshold = startup_alpha_threshold
+        self.startup_alpha_dot_threshold = startup_alpha_dot_threshold
+        self.startup_theta_target = startup_theta_target
         self.swingup_mode = swingup_mode
         self.use_stateful_switching = use_stateful_switching
         self.k = np.array(
@@ -60,6 +70,8 @@ class EnergySwingUpPDController:
             params.motor_resistance * params.arm_length * params.arm_mass
         ) / max(params.motor_torque_constant, 1e-9)
         self.balance_mode_active = False
+        self.startup_direction = 1.0
+        self.startup_active = True
 
     def _pendulum_energy(self, alpha_error: float, alpha_dot: float) -> float:
         alpha_from_down = float(wrap_angle(alpha_error - np.pi))
@@ -77,9 +89,33 @@ class EnergySwingUpPDController:
 
     def _energy_swingup_voltage(self, theta: float, alpha_error: float, theta_dot: float, alpha_dot: float) -> float:
         alpha_from_down = float(wrap_angle(alpha_error - np.pi))
+        startup_conditions = (
+            abs(alpha_from_down) < self.startup_alpha_threshold
+            and abs(alpha_dot) < self.startup_alpha_dot_threshold
+        )
+        if self.startup_active and not startup_conditions:
+            self.startup_active = False
+
+        if self.startup_active and startup_conditions:
+            if theta >= self.startup_theta_target:
+                self.startup_direction = -1.0
+            elif theta <= -self.startup_theta_target:
+                self.startup_direction = 1.0
+            elif abs(theta) < 1e-6:
+                self.startup_direction = 1.0
+            return float(self.startup_direction * self.startup_kick_voltage)
         energy = self._pendulum_energy(alpha_error, alpha_dot)
-        accel_cmd = -self.energy_gain * (energy - self.reference_energy) * alpha_dot * np.cos(alpha_from_down)
-        accel_cmd = float(np.clip(accel_cmd, -self.swingup_accel_limit, self.swingup_accel_limit))
+        pump_signal = (energy - self.reference_energy) * alpha_dot * np.cos(alpha_from_down)
+        if abs(pump_signal) < self.energy_deadband:
+            accel_cmd = 0.0
+        else:
+            accel_cmd = float(
+                np.clip(
+                    self.energy_gain * pump_signal,
+                    -self.swingup_accel_limit,
+                    self.swingup_accel_limit,
+                )
+            )
         voltage = self.accel_to_voltage * accel_cmd - self._arm_centering_voltage(theta, theta_dot)
         return float(np.clip(voltage, -self.swingup_voltage_limit, self.swingup_voltage_limit))
 

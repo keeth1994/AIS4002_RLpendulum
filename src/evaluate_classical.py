@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from src.controllers import EnergySwingUpPDController
+from src.controllers import EnergySwingUpPDController, ExampleEnergyPDController
 from src.envs import RotaryPendulumEnv
 from src.video import save_video_or_gif
 
@@ -36,6 +36,8 @@ def run_baseline(
     reward_mode: str = "recovery",
     terminate_on_arm_limit: bool = True,
     soft_arm_limit: bool = False,
+    controller_name: str = "hybrid",
+    controller_voltage_sign: float = 1.0,
 ) -> dict:
     env = RotaryPendulumEnv(
         max_episode_steps=steps,
@@ -50,7 +52,19 @@ def run_baseline(
         terminate_on_arm_limit=terminate_on_arm_limit,
     )
     obs, info = env.reset(seed=seed)
-    controller = EnergySwingUpPDController(env.params, **(controller_kwargs or {}))
+    if controller_name == "example":
+        controller = ExampleEnergyPDController(
+            dt=env.params.dt,
+            voltage_limit=env.params.voltage_limit,
+            energy_reference=(controller_kwargs or {}).get("example_energy_reference", 0.015),
+            energy_gain=(controller_kwargs or {}).get("example_energy_gain", 50.0),
+            swingup_u_max=(controller_kwargs or {}).get("example_u_max", 2.5),
+            balance_range_deg=(controller_kwargs or {}).get("example_balance_range_deg", 20.0),
+            startup_kick_voltage=(controller_kwargs or {}).get("example_startup_kick_voltage", 0.0),
+            startup_kick_seconds=(controller_kwargs or {}).get("example_startup_kick_seconds", 0.0),
+        )
+    else:
+        controller = EnergySwingUpPDController(env.params, **(controller_kwargs or {}))
 
     rows = []
     frames = []
@@ -64,6 +78,7 @@ def run_baseline(
             voltage_command = controller.open_loop_swingup(time_s, env.state.copy())
         else:
             voltage_command = controller.command(env.state.copy(), time_s)
+        voltage_command = np.asarray(voltage_command, dtype=np.float32) * controller_voltage_sign
         action = voltage_to_action(voltage_command, env.params.voltage_limit)
         obs, reward, terminated, truncated, info = env.step(action)
         total_reward += reward
@@ -126,6 +141,8 @@ def main() -> None:
     parser.add_argument("--video", type=str, default="videos/classical_baseline.mp4")
     parser.add_argument("--plot", type=str, default="results/classical_baseline.png")
     parser.add_argument("--csv", type=str, default="results/classical_baseline.csv")
+    parser.add_argument("--controller", choices=["hybrid", "example"], default="hybrid")
+    parser.add_argument("--controller-voltage-sign", type=float, choices=[-1.0, 1.0], default=1.0)
     parser.add_argument("--arm-limit-deg", type=float, default=90.0)
     parser.add_argument("--open-loop", action="store_true")
     parser.add_argument("--initial-perturbation", type=float, default=0.25)
@@ -135,15 +152,26 @@ def main() -> None:
     parser.add_argument("--reward-mode", choices=["report_balance", "recovery"], default="recovery")
     parser.add_argument("--terminate-on-arm-limit", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--soft-arm-limit", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--energy-gain", type=float, default=50.0)
+    parser.add_argument("--energy-gain", type=float, default=300.0)
+    parser.add_argument("--energy-deadband", type=float, default=0.002)
     parser.add_argument("--balance-voltage-limit", type=float, default=5.0)
     parser.add_argument("--swingup-voltage-limit", type=float, default=10.0)
     parser.add_argument("--swingup-frequency-hz", type=float, default=1.5)
     parser.add_argument("--swingup-amplitude", type=float, default=10.0)
     parser.add_argument("--swingup-mode", choices=["oscillatory", "energy"], default="oscillatory")
-    parser.add_argument("--swingup-accel-limit", type=float, default=6.0)
-    parser.add_argument("--arm-centering-gain", type=float, default=1.3235294117647058)
-    parser.add_argument("--arm-centering-rate-gain", type=float, default=1.134453781512605)
+    parser.add_argument("--swingup-accel-limit", type=float, default=8.0)
+    parser.add_argument("--arm-centering-gain", type=float, default=2.0)
+    parser.add_argument("--arm-centering-rate-gain", type=float, default=0.3)
+    parser.add_argument("--startup-kick-voltage", type=float, default=2.5)
+    parser.add_argument("--startup-alpha-threshold-deg", type=float, default=8.0)
+    parser.add_argument("--startup-alpha-dot-threshold", type=float, default=0.25)
+    parser.add_argument("--startup-theta-target-deg", type=float, default=20.0)
+    parser.add_argument("--example-energy-reference", type=float, default=0.015)
+    parser.add_argument("--example-energy-gain", type=float, default=50.0)
+    parser.add_argument("--example-u-max", type=float, default=2.5)
+    parser.add_argument("--example-balance-range-deg", type=float, default=20.0)
+    parser.add_argument("--example-startup-kick-voltage", type=float, default=0.0)
+    parser.add_argument("--example-startup-kick-seconds", type=float, default=0.0)
     args = parser.parse_args()
 
     video_path = None if args.video.lower() == "none" else Path(args.video)
@@ -162,6 +190,7 @@ def main() -> None:
         args.render_style,
         {
             "energy_gain": args.energy_gain,
+            "energy_deadband": args.energy_deadband,
             "balance_voltage_limit": args.balance_voltage_limit,
             "swingup_voltage_limit": args.swingup_voltage_limit,
             "swingup_frequency_hz": args.swingup_frequency_hz,
@@ -170,11 +199,23 @@ def main() -> None:
             "swingup_accel_limit": args.swingup_accel_limit,
             "arm_centering_gain": args.arm_centering_gain,
             "arm_centering_rate_gain": args.arm_centering_rate_gain,
+            "startup_kick_voltage": args.startup_kick_voltage,
+            "startup_alpha_threshold": np.deg2rad(args.startup_alpha_threshold_deg),
+            "startup_alpha_dot_threshold": args.startup_alpha_dot_threshold,
+            "startup_theta_target": np.deg2rad(args.startup_theta_target_deg),
+            "example_energy_reference": args.example_energy_reference,
+            "example_energy_gain": args.example_energy_gain,
+            "example_u_max": args.example_u_max,
+            "example_balance_range_deg": args.example_balance_range_deg,
+            "example_startup_kick_voltage": args.example_startup_kick_voltage,
+            "example_startup_kick_seconds": args.example_startup_kick_seconds,
         },
         args.reset_mode,
         args.reward_mode,
         args.terminate_on_arm_limit,
         args.soft_arm_limit,
+        args.controller,
+        args.controller_voltage_sign,
     )
     print("Classical baseline metrics:")
     for key, value in metrics.items():

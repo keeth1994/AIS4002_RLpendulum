@@ -8,10 +8,11 @@ QUBE qube;
 const float PI_F = 3.14159265358979323846f;
 const float DEG_TO_RAD_F = PI_F / 180.0f;
 
-// Main hardware knobs. This policy is a balance controller, so start near upright.
+// Main hardware knobs. This policy was trained for swing-up and balance from
+// the hanging-down start in the calibrated simulator.
 const float CONTROL_DT_SECONDS = 1.0f / 300.0f;
 const float POLICY_VOLTAGE_GAIN = 1.0f;
-const float HARD_VOLTAGE_LIMIT = 5.0f;
+const float HARD_VOLTAGE_LIMIT = 10.0f;
 const float ARM_LIMIT_RAD = 0.5f * PI_F;
 const float ARM_LIMIT_BRAKE_GAIN = 5.0f;
 const float ARM_LIMIT_DAMPING = 0.25f;
@@ -19,6 +20,7 @@ const float MOTOR_VOLTAGE_SIGN = 1.0f;
 const float THETA_SIGN = 1.0f;
 const float ALPHA_SIGN = 1.0f;
 const float ALPHA_OFFSET_RAD = PI_F;
+const float ANGLE_FILTER_ALPHA = 0.2f;
 const float VELOCITY_FILTER_ALPHA = 0.15f;
 
 const unsigned long START_DELAY_MS = 3000;
@@ -26,6 +28,8 @@ const int PRINT_EVERY_STEPS = 10;
 
 float previousTheta = 0.0f;
 float previousAlpha = PI_F;
+float filteredTheta = 0.0f;
+float filteredAlpha = PI_F;
 float thetaDot = 0.0f;
 float alphaDot = 0.0f;
 unsigned long previousMicros = 0;
@@ -66,9 +70,9 @@ void setup() {
   qube.setRGB(0, 0, 999);
   qube.update();
 
-  Serial.println("Pure RL QUBE runner");
-  Serial.println("This exported policy is balance-only.");
-  Serial.println("Start with the pendulum close to upright and the arm near center.");
+  Serial.println("RL QUBE runner");
+  Serial.println("This exported policy is a swing-up and balance controller.");
+  Serial.println("Start with the pendulum hanging down and the arm near center.");
   Serial.println("Starting in 3 seconds.");
   delay(START_DELAY_MS);
 
@@ -78,6 +82,8 @@ void setup() {
 
   previousTheta = readThetaRad();
   previousAlpha = readAlphaRad();
+  filteredTheta = previousTheta;
+  filteredAlpha = previousAlpha;
   previousMicros = micros();
 
   qube.setRGB(0, 999, 0);
@@ -104,8 +110,13 @@ void loop() {
   }
   previousMicros = now;
 
-  const float theta = readThetaRad();
-  const float alpha = readAlphaRad();
+  const float rawTheta = readThetaRad();
+  const float rawAlpha = readAlphaRad();
+  filteredTheta += ANGLE_FILTER_ALPHA * (rawTheta - filteredTheta);
+  filteredAlpha = wrapRad(filteredAlpha + ANGLE_FILTER_ALPHA * wrapRad(rawAlpha - filteredAlpha));
+
+  const float theta = filteredTheta;
+  const float alpha = filteredAlpha;
   const float rawThetaDot = (theta - previousTheta) / dt;
   const float rawAlphaDot = wrapRad(alpha - previousAlpha) / dt;
   previousTheta = theta;
@@ -133,8 +144,10 @@ void loop() {
     Serial.print(theta * 180.0f / PI_F, 1);
     Serial.print(" deg, alpha=");
     Serial.print(alpha * 180.0f / PI_F, 1);
-    Serial.print(" deg, rawPend=");
-    Serial.print(qube.getPendulumAngle(false), 1);
+    Serial.print(" deg, rawTheta=");
+    Serial.print(rawTheta * 180.0f / PI_F, 1);
+    Serial.print(" deg, rawAlpha=");
+    Serial.print(rawAlpha * 180.0f / PI_F, 1);
     Serial.print(" deg");
     Serial.print(", thetaDot=");
     Serial.print(thetaDot, 3);

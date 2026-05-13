@@ -29,11 +29,23 @@ void loop() {
   qube.setMotorVoltage(0.0f);
   qube.update();
 
+  long motorCount = qube.getMotorEncoder();
+  long pendulumCount = qube.getPendulumEncoder();
   float theta = qube.getMotorAngle(false) * QUBE_DEG_TO_RAD;
   float rawFromDown = qube.getPendulumAngle(false) * QUBE_DEG_TO_RAD;
   float alpha = wrapAngle(rawFromDown + 3.14159265f);
 
-  Serial.print("theta_rad=");
+  Serial.print("raw=[");
+  for (int i = 0; i < 6; ++i) {
+    if (i > 0) Serial.print(",");
+    Serial.print((long)qube.input[i]);
+  }
+  Serial.print("] ");
+  Serial.print("motor_count=");
+  Serial.print(motorCount);
+  Serial.print(" pendulum_count=");
+  Serial.print(pendulumCount);
+  Serial.print(" theta_rad=");
   Serial.print(theta);
   Serial.print(" alpha_rad=");
   Serial.print(alpha);

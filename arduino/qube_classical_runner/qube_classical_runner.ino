@@ -17,14 +17,14 @@ const unsigned long START_DELAY_MS = 3000;
 const int PRINT_EVERY_STEPS = 10;
 
 // Hardware-facing calibration.
-const float HARD_VOLTAGE_LIMIT = 5.0f;
+const float HARD_VOLTAGE_LIMIT = 8.0f;
 const float MOTOR_VOLTAGE_SIGN = 1.0f;
 const float THETA_SIGN = 1.0f;
 const float ALPHA_SIGN = 1.0f;
 const float ALPHA_OFFSET_RAD = PI_F;
 const float CENTER_TRIM_DEG = 0.0f;
 const float MOTOR_BIAS_VOLTAGE = 0.0f;
-const int RUN_MODE = 0;  // 0=sensors, 1=motor sign, 2=classical controller
+const int RUN_MODE = 2;  // 0=sensors, 1=motor sign, 2=classical controller
 const float TEST_VOLTAGE = 0.5f;
 
 // Arm protection.
@@ -32,33 +32,18 @@ const float ARM_LIMIT_RAD = 0.5f * PI_F;
 const float ARM_LIMIT_BRAKE_GAIN = 5.0f;
 const float ARM_LIMIT_DAMPING = 0.25f;
 
-// Example-code physical parameters.
-const float EXAMPLE_PENDULUM_MASS = 0.1f;
-const float EXAMPLE_PENDULUM_LENGTH = 0.095f;
-const float EXAMPLE_PENDULUM_COM = EXAMPLE_PENDULUM_LENGTH * 0.5f;
-const float EXAMPLE_PENDULUM_INERTIA =
-    EXAMPLE_PENDULUM_MASS * EXAMPLE_PENDULUM_LENGTH * EXAMPLE_PENDULUM_LENGTH / 3.0f;
-
-// Voltage scaling copied from the example code.
-const float ARM_MASS = 0.095f;
-const float ARM_LENGTH = 0.085f;
-const float GRAVITY = 9.81f;
-const float MOTOR_RESISTANCE = 8.4f;
-const float MOTOR_TORQUE_CONSTANT = 0.042f;
-const float ACCEL_TO_VOLTAGE = (MOTOR_RESISTANCE * ARM_LENGTH * ARM_MASS) / MOTOR_TORQUE_CONSTANT;
-
-// Parameters copied directly from EXAMPLE_CODE/inverted_pendulum.py.
-const float REFERENCE_ENERGY = 0.015f;
-const float ENERGY_GAIN = 50.0f;
-const float SWINGUP_ACCEL_LIMIT = 2.5f;
+// Hybrid controller settings aligned with the simulator baseline.
 const float BALANCE_RANGE_DEG = 20.0f;
-const float BALANCE_SCALE = 0.33f;
-const float KP_THETA = 1.0f * BALANCE_SCALE;
-const float KD_THETA = 0.125f * BALANCE_SCALE;
-const float KP_POS = 0.07f * BALANCE_SCALE;
-const float KD_POS = 0.06f * BALANCE_SCALE;
+const float BALANCE_EXIT_RANGE_DEG = 35.0f;
+const float SWINGUP_FREQUENCY_HZ = 1.5f;
+const float SWINGUP_AMPLITUDE = 8.0f;
+const float THETA_GAIN = -1.3235294117647058f;
+const float ALPHA_GAIN = 18.90760723931717f;
+const float THETA_DOT_GAIN = -1.134453781512605f;
+const float ALPHA_DOT_GAIN = 2.3634509049146462f;
+const float ARM_CENTERING_GAIN = 1.3235294117647058f;
+const float ARM_CENTERING_RATE_GAIN = 1.134453781512605f;
 const float BALANCE_VOLTAGE_LIMIT = 5.0f;
-const float SWINGUP_VOLTAGE_LIMIT = 24.0f;
 const float FILTER_WC = 500.0f / TWO_PI_F;
 
 float previousThetaDeg = 0.0f;
@@ -68,8 +53,6 @@ float filteredAlphaDotDeg = 0.0f;
 unsigned long previousMicros = 0;
 unsigned long stepCount = 0;
 bool balanceModeActive = false;
-bool resetModeActive = false;
-unsigned long resetStartMicros = 0;
 bool testVoltagePositive = true;
 unsigned long lastTestToggleMicros = 0;
 
@@ -106,24 +89,19 @@ float degToRad(float angleDeg) {
   return angleDeg * DEG_TO_RAD_F;
 }
 
-float pendulumEnergy(float angleRad, float angularVelocityRad) {
-  const float kinetic = 0.5f * EXAMPLE_PENDULUM_INERTIA * angularVelocityRad * angularVelocityRad;
-  const float potential = EXAMPLE_PENDULUM_MASS * GRAVITY * EXAMPLE_PENDULUM_COM * (1.0f - cosf(angleRad));
-  return kinetic + potential;
+float computeSwingupVoltage(float thetaRad, float thetaDotRad, float timeS) {
+  float voltage = SWINGUP_AMPLITUDE * sinf(2.0f * PI_F * SWINGUP_FREQUENCY_HZ * timeS);
+  voltage -= ARM_CENTERING_GAIN * thetaRad + ARM_CENTERING_RATE_GAIN * thetaDotRad;
+  return constrain(voltage, -SWINGUP_AMPLITUDE, SWINGUP_AMPLITUDE);
 }
 
-float computeSwingupVoltage(float angleDeg, float angularVelocityRad) {
-  const float angleRad = degToRad(angleDeg);
-  const float energy = pendulumEnergy(angleRad, angularVelocityRad);
-  float u = ENERGY_GAIN * (energy - REFERENCE_ENERGY) * (-angularVelocityRad * cosf(angleRad));
-  u = constrain(u, -SWINGUP_ACCEL_LIMIT, SWINGUP_ACCEL_LIMIT);
-  return constrain(u * ACCEL_TO_VOLTAGE, -SWINGUP_VOLTAGE_LIMIT, SWINGUP_VOLTAGE_LIMIT);
-}
-
-float computeBalanceVoltage(float positionDeg, float angleDeg, float posRateDeg, float angleRateDeg) {
-  const float uPos = KP_POS * positionDeg + KD_POS * posRateDeg;
-  const float uAng = KP_THETA * angleDeg + KD_THETA * angleRateDeg;
-  return constrain(uPos + uAng, -BALANCE_VOLTAGE_LIMIT, BALANCE_VOLTAGE_LIMIT);
+float computeBalanceVoltage(float thetaRad, float alphaRad, float thetaDotRad, float alphaDotRad) {
+  float voltage = -(
+      THETA_GAIN * thetaRad
+      + ALPHA_GAIN * alphaRad
+      + THETA_DOT_GAIN * thetaDotRad
+      + ALPHA_DOT_GAIN * alphaDotRad);
+  return constrain(voltage, -BALANCE_VOLTAGE_LIMIT, BALANCE_VOLTAGE_LIMIT);
 }
 
 float applyArmLimitProtection(float thetaRad, float thetaDotRad, float voltage) {
@@ -136,10 +114,6 @@ float applyArmLimitProtection(float thetaRad, float thetaDotRad, float voltage) 
     if (protectedVoltage < brakeVoltage) protectedVoltage = brakeVoltage;
   }
   return clipFloat(protectedVoltage, HARD_VOLTAGE_LIMIT);
-}
-
-float computeSettleAngleDeg(float angleDeg) {
-  return (angleDeg < 0.0f) ? (angleDeg + 360.0f - 2.0f * angleDeg) : (-360.0f + 2.0f * angleDeg);
 }
 
 void stopMotor() {
@@ -178,7 +152,6 @@ void setup() {
   previousAlphaDeg = readAlphaDegForExample();
   previousMicros = micros();
   balanceModeActive = false;
-  resetModeActive = false;
   filteredThetaDotDeg = 0.0f;
   filteredAlphaDotDeg = 0.0f;
   testVoltagePositive = true;
@@ -228,24 +201,23 @@ void loop() {
     qube.setMotorVoltage(MOTOR_VOLTAGE_SIGN * (testVoltagePositive ? TEST_VOLTAGE : -TEST_VOLTAGE));
   } else if (!balanceModeActive && fabsf(alphaDeg) < BALANCE_RANGE_DEG) {
     balanceModeActive = true;
-  } else if (balanceModeActive && fabsf(alphaDeg) >= BALANCE_RANGE_DEG) {
+  } else if (balanceModeActive && fabsf(alphaDeg) > BALANCE_EXIT_RANGE_DEG) {
     balanceModeActive = false;
-    resetModeActive = true;
-    resetStartMicros = now;
   }
 
   float voltage = 0.0f;
   if (RUN_MODE == 2) {
-    if (resetModeActive) {
-      const float settleAngleDeg = computeSettleAngleDeg(alphaDeg);
-      voltage = computeSwingupVoltage(settleAngleDeg, degToRad(filteredAlphaDotDeg));
-      if ((now - resetStartMicros) * 1.0e-6f >= 2.0f) {
-        resetModeActive = false;
-      }
-    } else if (balanceModeActive) {
-      voltage = computeBalanceVoltage(thetaDeg, alphaDeg, filteredThetaDotDeg, filteredAlphaDotDeg);
+    if (balanceModeActive) {
+      voltage = computeBalanceVoltage(
+          degToRad(thetaDeg),
+          degToRad(alphaDeg),
+          degToRad(filteredThetaDotDeg),
+          degToRad(filteredAlphaDotDeg));
     } else {
-      voltage = computeSwingupVoltage(alphaDeg, degToRad(filteredAlphaDotDeg));
+      voltage = computeSwingupVoltage(
+          degToRad(thetaDeg),
+          degToRad(filteredThetaDotDeg),
+          stepCount * CONTROL_DT_SECONDS);
     }
 
     voltage += MOTOR_BIAS_VOLTAGE;
@@ -264,8 +236,6 @@ void loop() {
       Serial.print("sensors");
     } else if (RUN_MODE == 1) {
       Serial.print(testVoltagePositive ? "test_pos" : "test_neg");
-    } else if (resetModeActive) {
-      Serial.print("reset");
     } else {
       Serial.print(balanceModeActive ? "balance" : "swingup");
     }
