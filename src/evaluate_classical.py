@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import sys
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -43,14 +45,13 @@ def run_baseline(
         max_episode_steps=steps,
         seed=seed,
         arm_limit_rad=np.deg2rad(arm_limit_deg),
-        initial_perturbation=initial_perturbation,
-        voltage_limit=voltage_limit,
-        render_style=render_style,
-        reset_mode=reset_mode,
-        reward_mode=reward_mode,
-        soft_arm_limit=soft_arm_limit,
-        terminate_on_arm_limit=terminate_on_arm_limit,
     )
+    env.base_params = replace(
+        env.base_params,
+        voltage_limit=voltage_limit,
+        dt=1.0 / 300.0,
+    )
+    env.params = env.base_params
     obs, info = env.reset(seed=seed)
     if controller_name == "example":
         controller = ExampleEnergyPDController(
@@ -79,8 +80,20 @@ def run_baseline(
         else:
             voltage_command = controller.command(env.state.copy(), time_s)
         voltage_command = np.asarray(voltage_command, dtype=np.float32) * controller_voltage_sign
+        if soft_arm_limit:
+            theta, _, theta_dot, _ = env.state
+            if theta > env.arm_limit_rad:
+                over_rad = theta - env.arm_limit_rad
+                brake_voltage = -(10.0 * over_rad + 0.5 * theta_dot)
+                voltage_command[0] = min(float(voltage_command[0]), brake_voltage)
+            elif theta < -env.arm_limit_rad:
+                over_rad = theta + env.arm_limit_rad
+                brake_voltage = -(10.0 * over_rad + 0.5 * theta_dot)
+                voltage_command[0] = max(float(voltage_command[0]), brake_voltage)
         action = voltage_to_action(voltage_command, env.params.voltage_limit)
         obs, reward, terminated, truncated, info = env.step(action)
+        if terminated and not terminate_on_arm_limit:
+            terminated = False
         total_reward += reward
         min_abs_alpha = min(min_abs_alpha, abs(info["alpha"]))
         max_abs_theta = max(max_abs_theta, abs(info["theta"]))
@@ -136,6 +149,12 @@ def run_baseline(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--preset",
+        choices=["none", "report-classical"],
+        default="none",
+        help="Apply a reproducible parameter set used for the report classical validation.",
+    )
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--video", type=str, default="videos/classical_baseline.mp4")
@@ -173,6 +192,8 @@ def main() -> None:
     parser.add_argument("--example-startup-kick-voltage", type=float, default=0.0)
     parser.add_argument("--example-startup-kick-seconds", type=float, default=0.0)
     args = parser.parse_args()
+    if args.preset == "report-classical":
+        apply_report_classical_preset(args)
 
     video_path = None if args.video.lower() == "none" else Path(args.video)
     plot_path = None if args.plot.lower() == "none" else Path(args.plot)
@@ -220,6 +241,39 @@ def main() -> None:
     print("Classical baseline metrics:")
     for key, value in metrics.items():
         print(f"  {key}: {value:.3f}" if isinstance(value, float) else f"  {key}: {value}")
+
+
+def _arg_was_provided(flag: str) -> bool:
+    return flag in sys.argv[1:] or any(arg.startswith(f"{flag}=") for arg in sys.argv[1:])
+
+
+def _set_if_missing(args: argparse.Namespace, attr: str, value, flag: str) -> None:
+    if not _arg_was_provided(flag):
+        setattr(args, attr, value)
+
+
+def apply_report_classical_preset(args: argparse.Namespace) -> None:
+    """Preset matching the retained simulator-vs-hardware classical validation."""
+    _set_if_missing(args, "steps", 1800, "--steps")
+    _set_if_missing(args, "video", "none", "--video")
+    _set_if_missing(args, "plot", "none", "--plot")
+    _set_if_missing(args, "csv", "results/classical_sim_report.csv", "--csv")
+    _set_if_missing(args, "controller", "example", "--controller")
+    _set_if_missing(args, "controller_voltage_sign", 1.0, "--controller-voltage-sign")
+    _set_if_missing(args, "arm_limit_deg", 90.0, "--arm-limit-deg")
+    _set_if_missing(args, "initial_perturbation", 0.25, "--initial-perturbation")
+    _set_if_missing(args, "voltage_limit", 5.0, "--voltage-limit")
+    _set_if_missing(args, "reset_mode", "down", "--reset-mode")
+    if not _arg_was_provided("--terminate-on-arm-limit") and not _arg_was_provided("--no-terminate-on-arm-limit"):
+        args.terminate_on_arm_limit = False
+    if not _arg_was_provided("--soft-arm-limit") and not _arg_was_provided("--no-soft-arm-limit"):
+        args.soft_arm_limit = True
+    _set_if_missing(args, "example_energy_reference", 0.015, "--example-energy-reference")
+    _set_if_missing(args, "example_energy_gain", 50.0, "--example-energy-gain")
+    _set_if_missing(args, "example_u_max", 2.5, "--example-u-max")
+    _set_if_missing(args, "example_balance_range_deg", 20.0, "--example-balance-range-deg")
+    _set_if_missing(args, "example_startup_kick_voltage", 1.5, "--example-startup-kick-voltage")
+    _set_if_missing(args, "example_startup_kick_seconds", 0.15, "--example-startup-kick-seconds")
 
 
 if __name__ == "__main__":

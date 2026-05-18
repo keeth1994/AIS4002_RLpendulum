@@ -62,6 +62,39 @@ controller. This was chosen because direct zero-shot RL swing-up transfer was
 not repeatable on the physical QUBE, while the residual setup was able to
 sustain upright balance after classical capture.
 
+### Validate the Energy-Controller Example
+
+Run the course/example energy swing-up plus PD balance controller on the QUBE,
+then compare the new hardware log to the retained calibrated simulation log.
+The latest tested port was `COM13`; change it if Windows assigns another port.
+
+```powershell
+python -m src.hardware.run_classical_on_qube --preset report-classical --port COM13 --csv results/classical_hw_report.csv
+python -m src.compare_classical --sim-csv results/classical_sim_example_calibrated_defaults.csv --hw-csv results/classical_hw_report.csv --output results/report_figures/classical_report_sim_vs_hw.png --duration 6
+```
+
+For reference, the retained validation logs already in the repository are:
+
+```powershell
+python -m src.compare_classical --sim-csv results/classical_sim_example_calibrated_defaults.csv --hw-csv results/classical_hw_example_calm_kick_com13.csv --output results/report_figures/classical_existing_sim_vs_hw.png --duration 6
+```
+
+The comparison is meant to validate qualitative controller behavior and key
+metrics, not exact point-by-point trajectory matching. Hardware timing,
+friction, encoder quantization, and manual initial conditions make the real
+trajectory diverge even when the controller and simulator are close enough for
+the assignment.
+
+If you specifically want to regenerate a fresh, uncalibrated simulator run of
+the same controller implementation, use:
+
+```powershell
+python -m src.evaluate_classical --preset report-classical --csv results/classical_sim_report.csv
+```
+
+For the report comparison, prefer the retained calibrated simulation log above,
+because it is the version already matched against the QUBE data.
+
 ### Train the SAC Balance Policy
 
 This trains the upright balance policy used by the hardware residual controller:
@@ -110,6 +143,15 @@ python -m src.analyze_hardware_log results\hw_report_demo.csv
 
 The script reports mode counts, upright ratio, longest upright interval, maximum
 arm travel, voltage usage, and final state.
+
+### Compare RL Balance Sim-To-Real
+
+After a hardware RL-residual run, align the hardware trace at the settled
+upright RL phase and compare it with the same RL balance policy in simulation:
+
+```powershell
+python -m src.compare_rl_sim_hw --hw-csv results/hw_rl_report_run.csv --model-path models/sac_report_balance_centered_5v_100k.zip --output results/report_figures/rl_report_sim_vs_hw.png
+```
 
 ### Generate Report Figures
 
@@ -242,11 +284,12 @@ AIS4002_RLpendulum/
 
 The `requirements.txt` file includes packages for:
 
-- numerical simulation: `numpy`, `scipy`
+- numerical simulation: `numpy`
 - plotting and result analysis: `matplotlib`, `pandas`
 - Gymnasium environments: `gymnasium`
 - RL algorithms: `stable-baselines3`
-- logging: `tensorboard`, `tqdm`
+- hardware serial communication: `pyserial`
+- logging and progress bars: `tensorboard`, `tqdm`
 - video export: `imageio`
 
 Quanser/QUBE hardware drivers are not included in `requirements.txt` because they normally depend on the course/lab installation instructions and vendor-specific software.

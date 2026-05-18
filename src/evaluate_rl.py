@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 from stable_baselines3 import PPO, SAC
 
 from src.envs import RotaryPendulumEnv
+from src.envs.rotary_pendulum import wrap_angle
 from src.video import save_video_or_gif
+
+QUBE_ARM_LENGTH_M = 0.085
+QUBE_PENDULUM_LENGTH_M = 0.1161
 
 REPORT_BALANCE_PRESET = {
     "algo": "sac",
@@ -29,6 +34,78 @@ REPORT_BALANCE_PRESET = {
     "action_rate_penalty": 0.0,
     "motor_dead_voltage": 0.0,
 }
+
+
+def reset_eval_state(env: RotaryPendulumEnv, args: argparse.Namespace, seed: int) -> tuple[np.ndarray, dict]:
+    obs, info = env.reset(seed=seed)
+    rng = np.random.default_rng(seed)
+    perturb = args.initial_perturbation
+    if args.reset_mode == "upright":
+        alpha = rng.normal(0.0, perturb)
+    elif args.reset_mode == "mixed":
+        alpha = rng.normal(0.0, perturb) if rng.random() < 0.5 else np.pi + rng.normal(0.0, perturb)
+    else:
+        alpha = np.pi + rng.normal(0.0, perturb)
+    theta = rng.normal(0.0, min(perturb, 0.10))
+    theta_dot = rng.normal(0.0, 0.05)
+    alpha_dot = rng.normal(0.0, 0.05)
+    env.state = np.array([theta, wrap_angle(alpha), theta_dot, alpha_dot], dtype=np.float64)
+    return build_policy_observation(env.state, args.obs_mode, 0.0, args.voltage_limit), env._get_info(0.0)
+
+
+def build_policy_observation(
+    state: np.ndarray,
+    obs_mode: str,
+    last_voltage: float,
+    voltage_limit: float,
+) -> np.ndarray:
+    theta, alpha, theta_dot, alpha_dot = np.asarray(state, dtype=np.float32).reshape(4)
+    base = [
+        np.sin(theta),
+        np.cos(theta),
+        np.sin(alpha),
+        np.cos(alpha),
+        np.clip(theta_dot, -30.0, 30.0),
+        np.clip(alpha_dot, -40.0, 40.0),
+    ]
+    if obs_mode == "base6":
+        return np.array(base, dtype=np.float32)
+
+    pendulum_speed = np.sqrt(
+        (
+            -QUBE_ARM_LENGTH_M * np.sin(theta) * theta_dot
+            + QUBE_PENDULUM_LENGTH_M * np.cos(alpha) * alpha_dot
+        )
+        ** 2
+        + (
+            QUBE_ARM_LENGTH_M * np.cos(theta) * theta_dot
+            + QUBE_PENDULUM_LENGTH_M * np.sin(alpha) * alpha_dot
+        )
+        ** 2
+    )
+    if obs_mode == "speed7":
+        return np.array([*base, pendulum_speed], dtype=np.float32)
+    if obs_mode == "speed8":
+        return np.array([*base, pendulum_speed, last_voltage / max(voltage_limit, 1e-6)], dtype=np.float32)
+    raise ValueError(f"Unsupported obs_mode: {obs_mode}")
+
+
+def voltage_from_action(
+    action: np.ndarray,
+    previous_voltage: float,
+    dt: float,
+    args: argparse.Namespace,
+) -> float:
+    command = float(np.asarray(action, dtype=np.float32).reshape(-1)[0])
+    target = float(np.clip(command, -1.0, 1.0) * args.voltage_limit)
+    if 0.0 < abs(target) < args.motor_dead_voltage:
+        target = float(np.sign(target) * args.motor_dead_voltage)
+    alpha = float(np.clip(args.action_filter_alpha, 0.0, 1.0))
+    voltage = previous_voltage + alpha * (target - previous_voltage)
+    if args.voltage_slew_rate > 0.0:
+        max_delta = args.voltage_slew_rate * dt
+        voltage = float(np.clip(voltage, previous_voltage - max_delta, previous_voltage + max_delta))
+    return float(np.clip(voltage, -args.voltage_limit, args.voltage_limit))
 
 
 def main() -> None:
@@ -74,20 +151,9 @@ def main() -> None:
         max_episode_steps=args.steps,
         seed=args.seed,
         arm_limit_rad=np.deg2rad(args.arm_limit_deg),
-        initial_perturbation=args.initial_perturbation,
-        voltage_limit=args.voltage_limit,
-        soft_arm_limit=args.soft_arm_limit,
-        terminate_on_arm_limit=not args.soft_arm_limit,
-        sensor_noise=args.sensor_noise,
-        reset_mode=args.reset_mode,
-        reward_mode=args.reward_mode,
-        obs_mode=args.obs_mode,
-        render_style=args.render_style,
-        action_filter_alpha=args.action_filter_alpha,
-        voltage_slew_rate=args.voltage_slew_rate,
-        action_rate_penalty=args.action_rate_penalty,
-        motor_dead_voltage=args.motor_dead_voltage,
     )
+    env.base_params = replace(env.base_params, voltage_limit=args.voltage_limit)
+    env.params = env.base_params
     frames = []
     returns = []
     upright_ratios = []
@@ -98,15 +164,24 @@ def main() -> None:
     termination_reasons = []
 
     for episode in range(args.episodes):
-        obs, info = env.reset(seed=args.seed + episode)
+        obs, info = reset_eval_state(env, args, args.seed + episode)
+        obs = np.clip(obs, model.observation_space.low, model.observation_space.high).astype(np.float32)
         episode_return = 0.0
         upright_count = 0
         first_recovery_time = None
         min_abs_alpha = np.inf
         max_abs_theta = 0.0
+        previous_voltage = 0.0
+        termination_reason = "time_limit"
         for step in range(args.steps):
             action, _ = model.predict(obs, deterministic=not args.stochastic)
-            obs, reward, terminated, truncated, info = env.step(action)
+            voltage = voltage_from_action(action, previous_voltage, env.params.dt, args)
+            previous_voltage = voltage
+            obs_raw, reward, terminated, truncated, info = env.step([voltage])
+            if terminated and args.soft_arm_limit:
+                terminated = False
+            obs = build_policy_observation(env.state, args.obs_mode, previous_voltage, args.voltage_limit)
+            obs = np.clip(obs, model.observation_space.low, model.observation_space.high).astype(np.float32)
             episode_return += reward
             min_abs_alpha = min(min_abs_alpha, abs(info["alpha"]))
             max_abs_theta = max(max_abs_theta, abs(info["theta"]))
@@ -117,6 +192,7 @@ def main() -> None:
             if episode == 0 and step % 2 == 0:
                 frames.append(env.render())
             if terminated or truncated:
+                termination_reason = "arm_limit" if terminated else "time_limit"
                 break
         returns.append(episode_return)
         episode_steps = step + 1
@@ -125,7 +201,7 @@ def main() -> None:
         episode_lengths.append(episode_steps)
         min_abs_alpha_deg.append(float(np.rad2deg(min_abs_alpha)))
         max_abs_theta_deg.append(float(np.rad2deg(max_abs_theta)))
-        termination_reasons.append(info.get("termination_reason", "unknown"))
+        termination_reasons.append(termination_reason)
 
     video_path = None if args.video.lower() == "none" else Path(args.video)
     if video_path is not None and frames:

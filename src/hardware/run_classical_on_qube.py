@@ -514,8 +514,45 @@ def normalize_example_angle(raw_pendulum_deg: float) -> float:
     return angle_deg
 
 
+def _arg_was_provided(flag: str) -> bool:
+    return flag in sys.argv[1:] or any(arg.startswith(f"{flag}=") for arg in sys.argv[1:])
+
+
+def _set_if_missing(args: argparse.Namespace, attr: str, value, flag: str) -> None:
+    if not _arg_was_provided(flag):
+        setattr(args, attr, value)
+
+
+def apply_report_classical_preset(args: argparse.Namespace) -> None:
+    """Hardware preset for the report classical simulator validation run."""
+    _set_if_missing(args, "controller", "example", "--controller")
+    _set_if_missing(args, "duration", 6.0, "--duration")
+    _set_if_missing(args, "rate_hz", 300.0, "--rate-hz")
+    _set_if_missing(args, "hard_voltage_limit", 5.0, "--hard-voltage-limit")
+    _set_if_missing(args, "example_energy_ref", 0.015, "--example-energy-ref")
+    _set_if_missing(args, "example_energy_gain", 50.0, "--example-energy-gain")
+    _set_if_missing(args, "example_u_max", 2.5, "--example-u-max")
+    _set_if_missing(args, "example_balance_range_deg", 20.0, "--example-balance-range-deg")
+    _set_if_missing(args, "example_startup_kick_voltage", 1.5, "--example-startup-kick-voltage")
+    _set_if_missing(args, "example_startup_kick_seconds", 0.15, "--example-startup-kick-seconds")
+    _set_if_missing(args, "motor_voltage_sign", 1.0, "--motor-voltage-sign")
+    _set_if_missing(args, "theta_sign", 1.0, "--theta-sign")
+    _set_if_missing(args, "alpha_sign", 1.0, "--alpha-sign")
+    _set_if_missing(args, "center_trim_deg", 0.0, "--center-trim-deg")
+    _set_if_missing(args, "arm_soft_limit_deg", 90.0, "--arm-soft-limit-deg")
+    _set_if_missing(args, "arm_hard_stop_deg", 130.0, "--arm-hard-stop-deg")
+    if args.csv is None and not _arg_was_provided("--csv"):
+        args.csv = Path("results/classical_hw_report.csv")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--preset",
+        choices=["none", "report-classical"],
+        default="none",
+        help="Apply the reproducible hardware settings used for report classical validation.",
+    )
     parser.add_argument("--port", type=str, default="COM3")
     parser.add_argument("--baudrate", type=int, default=115200)
     parser.add_argument("--example-dir", type=Path, default=Path("EXAMPLE_CODE"))
@@ -581,6 +618,8 @@ def main() -> None:
     parser.add_argument("--csv", type=Path, default=None)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if args.preset == "report-classical":
+        apply_report_classical_preset(args)
 
     csv_path = args.csv
     if csv_path is None:
